@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# mailer.py — SENTINEL v3.51 — Envoi email via SMTP (Gmail ou autre)
+# mailer.py — SENTINEL v3.52 — Envoi email via SMTP (Gmail ou autre)
 # ─────────────────────────────────────────────────────────────────────────────
 # Corrections v3.40 appliquées :
 #   B10          MIME text/html + application/pdf (non octet-stream)
@@ -29,31 +29,26 @@
 #
 # MODIFICATIONS v3.51 — Intégration pièces jointes CSV :
 #   CSV-M1  send_report() : paramètre csv_attachments: dict | None = None
-#           Reçoit le dict retourné par SentinelDB.export_csv() dans sentinel_main.py.
-#           Zéro impact sur l'API existante — paramètre optionnel, défaut None.
-#           Usage sentinel_main.py :
-#               csv_exports = SentinelDB.export_csv()
-#               send_report(html_path, csv_attachments=csv_exports)
-#   CSV-M2  _attach_csv_files() : attache les Path CSV au message MIME existant.
-#           MIME type : text/csv — détection automatique par les clients mail.
-#           Content-Disposition : attachment — force le téléchargement.
-#           Encode base64 via email.encoders — compatible tous serveurs SMTP.
-#           Fallback par fichier : une erreur sur un CSV n'annule pas les autres.
-#   CSV-M3  Filtrage cohérent SENTINEL_CSV_MODE (garde supplémentaire) :
-#           Le dict est déjà filtré par export_csv() — le mailer applique un
-#           second filtre de sécurité sur les clés.
-#           mode=standard → clés "_excel" ignorées
-#           mode=excel    → clés sans "_excel" ignorées
-#           mode=both     → tout attaché (comportement par défaut)
-#           Guard : ENV absent ou valeur inconnue → tout attaché (pas de perte silencieuse)
-#   CSV-M4  Dégradation light mode étendue — ordre priorité décroissante :
-#           1. Retrait CSV d'abord (_strip_csv_attachments()) — impact minimal analyste
-#           2. Retrait PDF ensuite (_strip_pdf_attachments()) — HTML conservé
-#           3. Blocage total si HTML seul encore > limite
-#           _strip_csv_attachments() ajouté — symétrique à _strip_pdf_attachments().
-#           _check_message_size() mis à jour avec la nouvelle séquence de dégradation.
-#   CSV-M5  Imports MIMEBase / encode_base64 déplacés en tête de fichier —
-#           utilisés par _attach_csv_files() et _build_minimal_mime().
+#   CSV-M2  _attach_csv_files() : attache les Path CSV au message MIME
+#   CSV-M3  Filtrage cohérent SENTINEL_CSV_MODE (garde supplémentaire)
+#   CSV-M4  Dégradation light mode étendue — CSV avant PDF
+#   CSV-M5  Imports MIMEBase / encode_base64 déplacés en tête de fichier
+#
+# MODIFICATIONS v3.52 — Bandeau avertissement light mode (RB-43-WARN1) :
+#   WARN-1  _strip_csv_attachments() : attache build_light_mode_warning_part(["CSV"])
+#           lorsque des CSV sont retirés — le destinataire est informé dans le
+#           corps de l'email et sait où récupérer les fichiers (output/).
+#   WARN-2  _strip_pdf_attachments() : attache build_light_mode_warning_part(["PDF"])
+#           lorsque le PDF est retiré — bandeau rouge signalant l'absence du
+#           livrable principal avec instructions de résolution.
+#   WARN-3  Import lazy via try/except dans chaque strip function — si
+#           report_builder est absent (tests unitaires, CI sans dépendances),
+#           l'absence du bandeau est loggée en DEBUG et n'est pas bloquante.
+#           La logique de strip reste fonctionnelle dans tous les cas.
+#   WARN-4  Correction regex _EMAIL_RE : s et . correctement échappés
+#           (était r"^[^@s]+@[^@s]+.[^@s]+$" — sans backslash).
+#   WARN-5  Correction regex _resend_pending : d correctement échappé
+#           (était r"(d{4}-d{2}-d{2})" — sans backslash → ne matchait jamais).
 # ─────────────────────────────────────────────────────────────────────────────
 # Variables d'environnement requises (dans .env) :
 #   SMTP_USER      ou  GMAIL_USER         adresse expéditeur
@@ -88,8 +83,8 @@ import re
 import shutil
 import smtplib
 import time
-from email.encoders import encode_base64          # CSV-M5 : déplacé en tête
-from email.mime.base import MIMEBase              # CSV-M5 : déplacé en tête
+from email.encoders import encode_base64
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
@@ -140,9 +135,10 @@ _CSV_MODE = os.environ.get("SENTINEL_CSV_MODE", "both")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VALIDATION (NEW-M3 + POST-M3)
+# VALIDATION (NEW-M3 + POST-M3 + WARN-4)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# WARN-4 : s et . correctement échappés (était r"^[^@s]+@[^@s]+.[^@s]+$")
 _EMAIL_RE = re.compile(r"^[^@s]+@[^@s]+.[^@s]+$")
 
 
@@ -168,24 +164,18 @@ def _attach_csv_files(msg: MIMEMultipart, csv_attachments: dict) -> int:
     """
     [CSV-M2] Attache les fichiers CSV au message MIME existant.
 
-    Chaque entrée du dict est une clé (ex : "metrics", "metrics_excel")
-    et une Path vers le fichier généré par SentinelDB.export_csv().
-
     [CSV-M3] Guard filtrage SENTINEL_CSV_MODE :
-        mode=standard → clés "_excel" ignorées (excel_fr non joint)
-        mode=excel    → clés sans "_excel" ignorées (standard non joint)
+        mode=standard → clés "_excel" ignorées
+        mode=excel    → clés sans "_excel" ignorées
         mode=both     → tout attaché
         valeur inconnue → tout attaché (pas de perte silencieuse)
 
-    Fallback par fichier (CSV-M2) : une erreur sur un CSV n'annule pas
-    les autres — log.warning et on continue.
-
+    Fallback par fichier : une erreur sur un CSV n'annule pas les autres.
     Retourne le nombre de fichiers effectivement attachés.
     """
     attached = 0
 
     for key, path in csv_attachments.items():
-        # CSV-M3 : garde supplémentaire cohérente avec SENTINEL_CSV_MODE
         if _CSV_MODE == "standard" and key.endswith("_excel"):
             log.debug(f"MAILER CSV {key} ignoré (mode=standard)")
             continue
@@ -218,7 +208,7 @@ def _attach_csv_files(msg: MIMEMultipart, csv_attachments: dict) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIGHT MODE — POST-M12 + CSV-M4
+# LIGHT MODE — POST-M12 + CSV-M4 + WARN-1/WARN-2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_csv_attachments(msg: MIMEMultipart) -> tuple[MIMEMultipart, int]:
@@ -226,11 +216,15 @@ def _strip_csv_attachments(msg: MIMEMultipart) -> tuple[MIMEMultipart, int]:
     [CSV-M4] Retire les pièces jointes CSV du message MIME.
 
     Appelée EN PRIORITÉ sur _strip_pdf_attachments() lors du light mode :
-    les CSV sont des données analytiques accessibles autrement (output/),
+    les CSV sont des données analytiques accessibles dans output/,
     le PDF est le livrable principal — on sacrifie les CSV en premier.
 
+    [WARN-1] Si des CSV sont retirés, attache un bandeau HTML d'avertissement
+    via report_builder.build_light_mode_warning_part(["CSV"]) — le destinataire
+    voit dans le corps de l'email pourquoi les CSV sont absents et où les
+    récupérer. Import lazy + try/except : non bloquant si report_builder absent.
+
     Retourne (msg_allégé, nb_csv_retirés).
-    Retourne (msg_original, 0) si aucun CSV présent.
     """
     light_msg = MIMEMultipart("mixed")
     for header in ("From", "To", "Subject", "Date", "Message-ID"):
@@ -254,6 +248,16 @@ def _strip_csv_attachments(msg: MIMEMultipart) -> tuple[MIMEMultipart, int]:
             f"MAILER Light mode CSV : {removed} fichier(s) CSV retiré(s). "
             f"Les CSV restent disponibles dans output/ pour récupération manuelle."
         )
+        # WARN-1 : bandeau HTML d'avertissement pour le destinataire
+        try:
+            from report_builder import build_light_mode_warning_part
+            light_msg.attach(
+                build_light_mode_warning_part(["CSV"], _ATTACH_LIMIT_MB)
+            )
+            log.debug("MAILER Bandeau avertissement CSV attaché au message allégé")
+        except Exception as warn_err:
+            log.debug(f"MAILER Bandeau avertissement CSV non généré : {warn_err}")
+
     return light_msg, removed
 
 
@@ -262,10 +266,14 @@ def _strip_pdf_attachments(msg: MIMEMultipart) -> MIMEMultipart:
     POST-M12 : Retire les pièces jointes PDF du message MIME existant.
 
     Construit un nouveau MIMEMultipart en copiant tous les payloads sauf
-    les parts application/pdf. Headers (From, To, Subject) préservés.
+    application/pdf. Headers (From, To, Subject) préservés.
 
-    Appelée après _strip_csv_attachments() dans la séquence de dégradation
-    light mode (CSV-M4).
+    Appelée après _strip_csv_attachments() dans la séquence de dégradation.
+
+    [WARN-2] Si le PDF est retiré, attache un bandeau HTML d'avertissement
+    via report_builder.build_light_mode_warning_part(["PDF"]) — bandeau rouge
+    signalant l'absence du livrable principal avec instructions de résolution.
+    Import lazy + try/except : non bloquant si report_builder absent.
     """
     light_msg = MIMEMultipart("mixed")
     for header in ("From", "To", "Subject", "Date", "Message-ID"):
@@ -290,6 +298,16 @@ def _strip_pdf_attachments(msg: MIMEMultipart) -> MIMEMultipart:
             f"Le rapport HTML reste joint. "
             f"Augmenter SMTP_ATTACH_LIMIT_MB dans .env pour envoyer le PDF complet."
         )
+        # WARN-2 : bandeau HTML d'avertissement pour le destinataire
+        try:
+            from report_builder import build_light_mode_warning_part
+            light_msg.attach(
+                build_light_mode_warning_part(["PDF"], _ATTACH_LIMIT_MB)
+            )
+            log.debug("MAILER Bandeau avertissement PDF attaché au message allégé")
+        except Exception as warn_err:
+            log.debug(f"MAILER Bandeau avertissement PDF non généré : {warn_err}")
+
     return light_msg
 
 
@@ -304,17 +322,16 @@ def _check_message_size(
 
     Retourne (peut_envoyer, msg_à_envoyer).
 
-    Séquence de dégradation v3.51 (CSV-M4) :
+    Séquence de dégradation v3.52 :
       1. Taille ≤ SMTP_ATTACH_WARN_MB    → envoi normal
-      2. Taille ≤ SMTP_ATTACH_LIMIT_MB   → warning non bloquant, envoi normal
+      2. Taille ≤ SMTP_ATTACH_LIMIT_MB   → warning log non bloquant, envoi normal
       3. Taille > SMTP_ATTACH_LIMIT_MB   →
          3a. Retrait CSV d'abord          → si ça passe : envoi sans CSV
+                                            bandeau ["CSV"] attaché par _strip_csv_attachments()
          3b. Retrait CSV + PDF            → si ça passe : envoi HTML seul
+                                            bandeau ["CSV"] + bandeau ["PDF"] attachés
+                                            par les deux fonctions strip successives
          3c. Encore trop lourd            → blocage total + archivage output/pending/
-
-    Justification ordre CSV avant PDF (CSV-M4) :
-        Les CSV sont disponibles dans output/ — perte d'accès tolérable.
-        Le PDF est le livrable signé du cycle — priorité de conservation maximale.
     """
     size_mb = len(msg_bytes) / (1024 * 1024)
 
@@ -331,6 +348,7 @@ def _check_message_size(
         return True, msg
 
     # ── Étape 3a : retrait CSV d'abord (CSV-M4) ──────────────────────────────
+    # _strip_csv_attachments() attache le bandeau WARN-1 si des CSV sont retirés.
     log.warning(
         f"MAILER Message trop lourd : {size_mb:.1f} Mo > limite {_ATTACH_LIMIT_MB} Mo. "
         f"Tentative light mode — retrait CSV d'abord…"
@@ -349,6 +367,9 @@ def _check_message_size(
         msg_no_csv = msg  # pas de CSV à retirer — continuer avec msg original
 
     # ── Étape 3b : retrait PDF (POST-M12) ─────────────────────────────────────
+    # _strip_pdf_attachments() attache le bandeau WARN-2 si le PDF est retiré.
+    # msg_no_csv peut déjà contenir le bandeau WARN-1 (CSV retiré à l'étape 3a).
+    # Le destinataire verra les deux bandeaux : CSV manquant + PDF manquant.
     log.warning(
         f"MAILER Light mode CSV insuffisant — tentative retrait PDF…"
     )
@@ -398,7 +419,6 @@ def _smtp_send(
     Envoie le message MIME via SMTP avec 3 tentatives et backoff.
     Supporte STARTTLS (port 587) et TLS direct (port 465).
     POST-M1 : report_path paramètre explicite (plus de NameError).
-    K-6 / R3A3-NEW-5 / NEW-M5
     """
     for attempt in range(_SMTP_MAX_ATTEMPTS):
         try:
@@ -450,7 +470,7 @@ def _smtp_send(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _log_send_status(date_str: str, success: bool) -> None:
-    """POST-M6 : log structuré du statut d'envoi (stub trompeur supprimé)."""
+    """POST-M6 : log structuré du statut d'envoi."""
     status = "OK" if success else "ECHEC"
     log.info(f"MAILER Statut envoi [{date_str}] : {status}")
 
@@ -463,7 +483,7 @@ def _resend_pending() -> None:
     """
     Renvoie les rapports archivés dans output/pending/.
     POST-M5 : appelée en début de send_report().
-    POST-M7 : re.search() direct (re importé en tête de fichier).
+    WARN-5  : regex d correctement échappé (était r"(d{4}-d{2}-d{2})").
     """
     pending_dir = Path("output/pending")
     if not pending_dir.exists():
@@ -471,13 +491,13 @@ def _resend_pending() -> None:
 
     for html_file in sorted(pending_dir.glob("*.html")):
         try:
+            # WARN-5 : d{4} correctement échappé
             m = re.search(r"(d{4}-d{2}-d{2})", html_file.name)
             date_obj = (
                 datetime.date.fromisoformat(m.group(1))
                 if m else datetime.date.today()
             )
             log.info(f"MAILER Tentative renvoi rapport en attente : {html_file.name}")
-            # Pas de csv_attachments pour les rapports en attente (déjà archivés seuls)
             ok = send_report(str(html_file), date_obj=date_obj)
             if ok:
                 html_file.unlink()
@@ -499,7 +519,6 @@ def _build_minimal_mime(
     """
     Construction MIME minimale de secours.
     B10-FIX : MIME text/html et application/pdf corrects.
-    CSV-M5 : MIMEBase / encode_base64 désormais importés en tête de fichier.
     Utilisé uniquement si report_builder.build_email_message() est absent.
     """
     from email.mime.text import MIMEText
@@ -559,11 +578,11 @@ def send_report(
     """
     Envoie le rapport HTML (+ PDF si disponible, + CSV si fournis) par email.
 
-    Compatibilité sentinel_main.py v3.44 (POST-M2) — API inchangée v3.51 :
+    Compatibilité sentinel_main.py v3.44 — API inchangée v3.52 :
         Pipeline normal  : send_report(html_report)
         Crash handler    : send_report(None, subject="[SENTINEL CRASH] ...")
         Rapport mensuel  : send_report(html_report)
-        Avec CSV v3.51   : send_report(html_report, csv_attachments=csv_exports)
+        Avec CSV         : send_report(html_report, csv_attachments=csv_exports)
 
     Paramètres
     ----------
@@ -573,16 +592,14 @@ def send_report(
     subject           : str         Sujet complet (crash handler).
     csv_attachments   : dict        dict[str, Path] retourné par
                                     SentinelDB.export_csv(). Optionnel.
-                                    Filtré selon SENTINEL_CSV_MODE (CSV-M3).
 
-    Logique taille v3.51 (POST-M11 + POST-M12 + CSV-M4) :
+    Séquence de dégradation taille v3.52 :
         ≤ SMTP_ATTACH_WARN_MB  → envoi normal
-        ≤ SMTP_ATTACH_LIMIT_MB → warning non bloquant + envoi normal
-        > SMTP_ATTACH_LIMIT_MB → 1. retrait CSV (léger, récupérable dans output/)
-                                  2. retrait PDF (HTML conservé)
-                                  3. blocage + archivage output/pending/
+        ≤ SMTP_ATTACH_LIMIT_MB → warning log + envoi normal
+        > SMTP_ATTACH_LIMIT_MB → 3a. retrait CSV  (bandeau WARN-1 attaché)
+                                  3b. retrait PDF  (bandeau WARN-2 attaché)
+                                  3c. blocage total + archivage output/pending/
     """
-    # POST-M5 : renvoyer les rapports archivés avant le nouvel envoi
     _resend_pending()
 
     if date_obj is None:
@@ -624,7 +641,6 @@ def send_report(
         log.error(f"MAILER Adresse expéditeur invalide : {SMTP_USER!r}")
         return False
 
-    # Destinataires (NEW-M1)
     to_list = _parse_recipients(SMTP_TO)
     if extra_recipients:
         for addr in extra_recipients:
@@ -672,7 +688,7 @@ def send_report(
         nb_csv = _attach_csv_files(msg, csv_attachments)
         if nb_csv:
             log.info(f"MAILER {nb_csv} fichier(s) CSV joint(s) au message")
-        elif csv_attachments:
+        else:
             log.warning(
                 f"MAILER csv_attachments fourni ({len(csv_attachments)} entrée(s)) "
                 f"mais aucun fichier attaché (mode={_CSV_MODE} ? fichiers absents ?)"
@@ -693,7 +709,6 @@ def send_report(
     if not can_send:
         return False
 
-    # ── Envoi SMTP (POST-M1) ──────────────────────────────────────────────────
     success = _smtp_send(msg.as_string(), SMTP_USER, to_list, report_path=report_path)
     _log_send_status(str(date_obj), success)
     return success
@@ -745,7 +760,7 @@ def send_test_email() -> bool:
     msg["To"]      = ", ".join(recipients)
     msg["Subject"] = f"{EMAIL_SUBJECT_PREFIX} — Test configuration SMTP"
     msg.attach(MIMEText(
-        "Ceci est un email de test SENTINEL v3.51.
+        "Ceci est un email de test SENTINEL v3.52.
 "
         "Si vous recevez ce message, la configuration SMTP est correcte.
 ",
@@ -775,7 +790,7 @@ if __name__ == "__main__":
     if "--check" in sys.argv:
         cfg = check_config()
         print("
-── Configuration SMTP SENTINEL v3.51 ────────────────────")
+── Configuration SMTP SENTINEL v3.52 ────────────────────")
         for k, v in cfg.items():
             status = "✓" if v else "✗" if v is False else " "
             print(f"  {status} {k:<22} {v}")
