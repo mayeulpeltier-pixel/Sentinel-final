@@ -12,17 +12,44 @@
 #   HC-FIX7              — vérification flux RSS parallèle (ThreadPoolExecutor)
 #   HC-FIX8   CDC-4      — vérification espace disque + estimation stockage 12 mois
 #   HC-FIX9              — validation marqueurs prompts (cohérence init_prompts.py)
-#   HC-FIX10 R6A3-NEW-2  — TAVILY_API_KEY : warning non-bloquant si absente
-#   HC-FIX11 K-6         — SMTP testé avec timeout (non-bloquant, warning seulement)
+#   HC-FIX10  R6A3-NEW-2 — TAVILY_API_KEY : warning non-bloquant si absente
+#   HC-FIX11  K-6        — SMTP testé avec timeout (non-bloquant, warning seulement)
 #   HC-FIX12             — rapport JSON complet dans logs/health_report.json
 #   HC-FIX13             — alerte email si erreurs critiques
-#   HC-FIX14 NEW-IP3     — validation marqueurs DEBUTJSONDELTA / FINJSONDELTA
+#   HC-FIX14  NEW-IP3    — validation marqueurs DEBUTJSONDELTA / FINJSONDELTA
 #   HC-FIX15             — mode --ci : sortie minimale, exit code strict
+#
+# Corrections v3.40-POST (post-audit) :
+#   POST-FIX1 — VERSION corrigée "3.38" → "3.40"
+#   POST-FIX2 — CORE_SCRIPTS : "sam_gov_scraper.py" → "samgov_scraper.py"
+#   POST-FIX3 — PROMPT_MARKERS daily.txt : "ARTICLESFILTRSPARSCRAPER" →
+#               "ARTICLESFILTRESPARSCRAPER" (typo E manquant, faux positif permanent)
+#   POST-FIX4 — PROMPT_MARKERS monthly.txt : marqueurs alignés sur sentinel_api v3.51
+#               "INJECTION30RAPPORTSCOMPRESSES" → "INJECTIONMENSUELLE"
+#               "EXECUTIVE SUMMARY" → "RÉSUMÉ EXÉCUTIF MENSUEL"
+#               "ANNE" supprimé (marqueur obsolète absent du template)
+#   POST-FIX5 — _record() : ajout branche "info" (évite log.error +
+#               _critical_count++ sur des records informatifs)
+#   POST-FIX6 — check_regression_analytique() : lit les tables tendances/alertes
+#               directement (reports.compressed contient les métriques, pas les
+#               deltas — fausse alerte "dérive modèle" permanente corrigée)
+#   POST-FIX7 — OLLAMA_TIMEOUT ajouté dans ENV_VARS (optionnel, sentinel_api v3.51)
+#   POST-FIX8 — Documentation --offline corrigée : ce mode ne préserve aucun
+#               quota API (les vérifs réseau sont des TCP/HTTP purs, sans appel
+#               à anthropic.messages.create() ni à Tavily search). Les vraies
+#               raisons d'utiliser --offline : vitesse (72 feeds = 8-15s),
+#               réseau restreint (VPN/proxy), logins SMTP répétés sur Gmail.
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage :
-#   python health_check.py              Vérification complète interactive
-#   python health_check.py --offline    Saute toutes les vérifs réseau/API
-#   python health_check.py --ci         Mode CI/CD : sortie minimale, exit strict
+#   python health_check.py              Vérification complète (déploiement serveur)
+#   python health_check.py --offline    Saute les vérifs réseau/RSS/SMTP/API TCP.
+#                                       Utiliser en dev local pour la vitesse
+#                                       (gain ~8-15s sur les 72 feeds RSS) et pour
+#                                       éviter les logins SMTP répétés sur Gmail.
+#                                       NB : ne préserve aucun quota Anthropic/Tavily
+#                                       — les vérifs réseau sont des TCP purs, sans
+#                                       appel à messages.create() ni search().
+#   python health_check.py --ci         Mode CI/CD : sortie minimale, exit code strict
 #   python health_check.py --feeds      Teste uniquement les flux RSS (verbose)
 #   python health_check.py --db         Teste uniquement la base SQLite
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,6 +58,11 @@
 #   1  — Avertissements non-bloquants (Tavily absent, feeds lents, etc.)
 #   2  — Erreurs critiques (Python < 3.10, ANTHROPIC_API_KEY manquante,
 #         scripts core absents, DB corrompue)
+#
+# Quand utiliser quel mode :
+#   Dev local         → --offline  (vitesse, pas de bruit réseau)
+#   Avant déploiement → standard   (vérification complète)
+#   CI/CD pipeline    → --ci       (sortie minimale, exit code strict)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -56,7 +88,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv optionnel au healthcheck lui-même
+    pass
 
 
 # ── Logging structuré (HC-FIX1 / FIX-OBS1) ──────────────────────────────────
@@ -72,19 +104,17 @@ log = logging.getLogger("sentinel.health")
 # CONSTANTES
 # ═════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "3.38"
-HC_TIMEOUT   = 8      # timeout HTTP par feed (secondes)
-SMTP_TIMEOUT = 10     # timeout vérification SMTP
-DISK_MIN_MB  = 500    # espace disque minimum recommandé (CDC-4)
-DISK_WARN_MB = 200    # seuil alerte critique espace disque
+VERSION      = "3.40"   # POST-FIX1 : était "3.38"
+HC_TIMEOUT   = 8
+SMTP_TIMEOUT = 10
+DISK_MIN_MB  = 500
+DISK_WARN_MB = 200
 
-# Flags CLI
 OFFLINE    = "--offline" in sys.argv
 CI_MODE    = "--ci"      in sys.argv
 FEEDS_ONLY = "--feeds"   in sys.argv
 DB_ONLY    = "--db"      in sys.argv
 
-# Couleurs ANSI (désactivées en mode CI ou sans terminal)
 if CI_MODE or not sys.stdout.isatty():
     OK   = "[OK]  "
     WARN = "[WARN]"
@@ -96,7 +126,6 @@ else:
     FAIL = "\u001B[91m[FAIL]\u001B[0m"
     INFO = "\u001B[94m[INFO]\u001B[0m"
 
-# Scripts CORE obligatoires
 CORE_SCRIPTS = [
     "scraper_rss.py",
     "memory_manager.py",
@@ -106,16 +135,14 @@ CORE_SCRIPTS = [
     "mailer.py",
     "sentinel_main.py",
     "db_manager.py",
-    "sam_gov_scraper.py",
+    "samgov_scraper.py",   # POST-FIX2 : était "sam_gov_scraper.py"
     "watchdog.py",
     "init_prompts.py",
     "health_check.py",
 ]
 
-# Dossiers obligatoires
 REQUIRED_DIRS = ["data", "output", "output/charts", "logs", "prompts"]
 
-# Prompts obligatoires + marqueurs à vérifier (HC-FIX9 / HC-FIX14)
 PROMPT_MARKERS: dict[str, list[str]] = {
     "prompts/system.txt": [
         "SENTINEL",
@@ -125,41 +152,39 @@ PROMPT_MARKERS: dict[str, list[str]] = {
     ],
     "prompts/daily.txt": [
         "DATEAUJOURDHUI",
-        "ARTICLESFILTRSPARSCRAPER",
+        "ARTICLESFILTRESPARSCRAPER",   # POST-FIX3 : E manquait → faux positif permanent
         "MEMOIRECOMPRESSE7JOURS",
         "DEBUTJSONDELTA",
         "FINJSONDELTA",
     ],
     "prompts/monthly.txt": [
         "MOIS",
-        "ANNE",
-        "INJECTION30RAPPORTSCOMPRESSES",
-        "EXECUTIVE SUMMARY",
+        "INJECTIONMENSUELLE",          # POST-FIX4 : était "INJECTION30RAPPORTSCOMPRESSES"
+        "RÉSUMÉ EXÉCUTIF MENSUEL",     # POST-FIX4 : était "EXECUTIVE SUMMARY"
         "STATISTIQUES",
         "TENDANCES LOURDES",
         "RUPTURES TECHNOLOGIQUES",
         "RECOMMANDATIONS",
+        # "ANNE" supprimé — POST-FIX4 : absent du template sentinel_api v3.51
     ],
 }
 
-# Packages pip : "critique" = bloquant, "optionnel" = warning seulement
 PIP_PACKAGES: dict[str, str] = {
     "anthropic":  "critique",
     "feedparser": "critique",
     "requests":   "critique",
-    "dotenv":     "critique",    # python-dotenv
+    "dotenv":     "critique",
     "matplotlib": "critique",
     "tavily":     "optionnel",
     "weasyprint": "optionnel",
     "plotly":     "optionnel",
     "kaleido":    "optionnel",
     "schedule":   "optionnel",
-    "sklearn":    "optionnel",   # scikit-learn
+    "sklearn":    "optionnel",
     "streamlit":  "optionnel",
     "telethon":   "optionnel",
 }
 
-# Variables ENV : (niveau, description)
 ENV_VARS: dict[str, tuple[str, str]] = {
     "ANTHROPIC_API_KEY":   ("critique",  "Clé API Anthropic — requise pour les rapports Claude"),
     "TAVILY_API_KEY":      ("optionnel", "Tavily web search — désactive la vérif web si absent"),
@@ -172,9 +197,44 @@ ENV_VARS: dict[str, tuple[str, str]] = {
     "SENTINEL_DB":         ("optionnel", "Chemin SQLite — défaut: data/sentinel.db"),
     "SENTINEL_MAX_TOKENS": ("optionnel", "Max tokens sortie Claude — défaut: 16000"),
     "SENTINEL_TAVILY_MAX": ("optionnel", "Max appels Tavily/rapport — défaut: 5"),
+    "OLLAMA_TIMEOUT":      ("optionnel", "Timeout Ollama local en secondes — défaut: 180"),
 }
 
-# Résultats cumulatifs\n_results:        list[dict[str, Any]] = []\n_critical_count: int = 0\n_warning_count:  int = 0\n\n\ndef _record(level: str, category: str, name: str, message: str, detail: str = "") -> None:\n    """Enregistre un résultat et l'affiche via le logger structuré."""\n    global _critical_count, _warning_count\n    _results.append({\n        "level":    level,\n        "category": category,\n        "name":     name,\n        "message":  message,\n        "detail":   detail,\n        "ts":       datetime.now(timezone.utc).isoformat(),\n    })\n    icon = OK if level == "ok" else WARN if level == "warning" else FAIL\n    line = f"{icon} [{category}] {name}: {message}"\n    if detail and not CI_MODE:\n        line += f"\n       → {detail}"\n    if level == "ok":\n        log.info(line)\n    elif level == "warning":\n        log.warning(line)\n        _warning_count += 1\n    else:\n        log.error(line)\n        _critical_count += 1
+_results:        list[dict[str, Any]] = []
+_critical_count: int = 0
+_warning_count:  int = 0
+
+
+def _record(level: str, category: str, name: str, message: str, detail: str = "") -> None:
+    """
+    POST-FIX5 : ajout branche "info" — avant, _record("info", ...) tombait dans
+    le else → log.error() + _critical_count++. Niveaux : ok|info|warning|critical.
+    """
+    global _critical_count, _warning_count
+    _results.append({
+        "level":    level,
+        "category": category,
+        "name":     name,
+        "message":  message,
+        "detail":   detail,
+        "ts":       datetime.now(timezone.utc).isoformat(),
+    })
+    icon = OK if level == "ok" else WARN if level in ("warning", "info") else FAIL
+    line = f"{icon} [{category}] {name}: {message}"
+    if detail and not CI_MODE:
+        line += f"
+       → {detail}"
+
+    if level == "ok":
+        log.info(line)
+    elif level == "info":
+        log.info(line)
+    elif level == "warning":
+        log.warning(line)
+        _warning_count += 1
+    else:
+        log.error(line)
+        _critical_count += 1
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -222,7 +282,6 @@ def check_packages() -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def check_structure() -> None:
-    # Scripts core
     for script in CORE_SCRIPTS:
         p = Path(script)
         if p.exists():
@@ -231,7 +290,6 @@ def check_structure() -> None:
             _record("critical", "Script", script, "ABSENT",
                     "Script core manquant — pipeline non fonctionnel")
 
-    # Dossiers
     for d in REQUIRED_DIRS:
         dp = Path(d)
         if dp.is_dir():
@@ -244,7 +302,6 @@ def check_structure() -> None:
             except OSError as e:
                 _record("critical", "Dossier", d, f"impossible de créer: {e}")
 
-    # Prompts + marqueurs
     for prompt_file, markers in PROMPT_MARKERS.items():
         pp = Path(prompt_file)
         if not pp.exists():
@@ -261,7 +318,6 @@ def check_structure() -> None:
             _record("ok", "Prompt", prompt_file,
                     f"{len(markers)} marqueurs OK ({pp.stat().st_size // 1024} KB) ✓")
 
-    # Fichiers projet
     for fname, (lvl, fix) in {
         "SCOPE.md":         ("warning", "python init_prompts.py"),
         "CHANGELOG.md":     ("warning", "python init_prompts.py"),
@@ -297,7 +353,6 @@ def check_env_vars() -> None:
             sfx = " (non bloquant)" if level == "optionnel" else ""
             _record(lvl, "ENV", var, f"ABSENTE{sfx}", desc)
 
-    # Validation format SENTINEL_MODEL (CODE-5)
     model = os.environ.get("SENTINEL_MODEL", "")
     if model:
         if not model.startswith("claude-") or len(model) < 12:
@@ -311,7 +366,6 @@ def check_env_vars() -> None:
                 "non défini — défaut claude-sonnet-4-6 (non bloquant)",
                 "Définir SENTINEL_MODEL=claude-sonnet-4-6 dans .env")
 
-    # Cohérence SMTP
     u = os.environ.get("SMTP_USER", "")
     p = os.environ.get("SMTP_PASS", "") or os.environ.get("SMTP_PASSWORD", "")
     if u and not p:
@@ -322,7 +376,6 @@ def check_env_vars() -> None:
     elif u and p:
         _record("ok", "ENV", "SMTP_COHERENCE", "SMTP_USER + SMTP_PASS cohérents ✓")
 
-    # SENTINEL_MAX_TOKENS cohérence
     max_tok = os.environ.get("SENTINEL_MAX_TOKENS", "")
     if max_tok:
         try:
@@ -339,6 +392,20 @@ def check_env_vars() -> None:
         except ValueError:
             _record("critical", "ENV", "SENTINEL_MAX_TOKENS",
                     f"Valeur non-entière : '{max_tok}'")
+
+    ollama_to = os.environ.get("OLLAMA_TIMEOUT", "")
+    if ollama_to:
+        try:
+            v = int(ollama_to)
+            if v < 30:
+                _record("warning", "ENV", "OLLAMA_TIMEOUT",
+                        f"Valeur faible : {v}s — insuffisant sur GPU milieu de gamme",
+                        "Recommandé : 90 (GPU rapide) | 180 (défaut) | 480 (CPU)")
+            else:
+                _record("ok", "ENV", "OLLAMA_TIMEOUT", f"{v}s ✓")
+        except ValueError:
+            _record("critical", "ENV", "OLLAMA_TIMEOUT",
+                    f"Valeur non-entière : '{ollama_to}'")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -362,7 +429,6 @@ def check_sqlite() -> dict[str, Any]:
         conn = sqlite3.connect(str(db_path), timeout=10)
         conn.row_factory = sqlite3.Row
 
-        # WAL mode (BUG-DB3)
         jmode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         if jmode.lower() == "wal":
             _record("ok", "SQLite", "journal_mode", "WAL ✓")
@@ -371,7 +437,6 @@ def check_sqlite() -> dict[str, Any]:
                     f"mode '{jmode}' (WAL attendu)",
                     "Sera corrigé par db_manager.create_connection() au prochain run")
 
-        # Intégrité ACID
         ic = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if ic == "ok":
             _record("ok", "SQLite", "integrity_check", "aucune corruption ✓")
@@ -380,7 +445,6 @@ def check_sqlite() -> dict[str, Any]:
                     f"CORRUPTION : {ic}",
                     f"Restaurer backup ou supprimer {db_path} et relancer sentinel_main.py")
 
-        # Tables v3.40
         expected = {"reports", "tendances", "alertes", "acteurs", "seenhashes", "metrics"}
         existing = {
             r[0] for r in conn.execute(
@@ -395,7 +459,6 @@ def check_sqlite() -> dict[str, Any]:
         else:
             _record("ok", "SQLite", "tables", "6/6 tables présentes ✓")
 
-        # BUG-DB1 : contrainte UNIQUE sur reports.date
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name='reports' AND type='table'"
         ).fetchone()
@@ -408,7 +471,6 @@ def check_sqlite() -> dict[str, Any]:
                     "UNIQUE absent sur reports.date — UPSERT ON CONFLICT échouera",
                     "Supprimer sentinel.db et relancer — schéma v3.40 recrée automatiquement")
 
-        # Index de performance (MAINT-DB3)
         expected_idx = {
             "idx_reports_date", "idx_seenhashes_date",
             "idx_tendances_active", "idx_alertes_active", "idx_acteurs_score",
@@ -427,7 +489,6 @@ def check_sqlite() -> dict[str, Any]:
         else:
             _record("ok", "SQLite", "index", f"{len(existing_idx)} index présents ✓")
 
-        # Comptages
         for table in expected & existing:
             try:
                 result[f"count_{table}"] = conn.execute(
@@ -443,7 +504,6 @@ def check_sqlite() -> dict[str, Any]:
                 f"{result.get('count_tendances', 0)} tendances | "
                 f"{result.get('count_acteurs', 0)} acteurs")
 
-        # Flag migration
         if (db_path.parent / ".migrationdonev3.37").exists():
             _record("ok", "SQLite", "migration_json", "migration JSON→SQLite effectuée ✓")
         else:
@@ -475,7 +535,8 @@ def _check_one_feed(args: tuple[str, str, str]) -> dict[str, Any]:
                     allow_redirects=True)
         ms = int((time.monotonic() - t0) * 1000)
         return {"source": source, "url": url, "score": score,
-                "status": r.status_code, "ok": r.status_code == 200 and len(r.content) > 100,
+                "status": r.status_code,
+                "ok": r.status_code == 200 and len(r.content) > 100,
                 "size": len(r.content), "ms": ms}
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
@@ -514,7 +575,6 @@ def check_rss_feeds(verbose: bool = False) -> list[dict]:
             f"{len(alive)}/{total} flux OK ({pct}%) — {len(dead)} morts",
             f"{len(slow)} flux lents >5s" if slow else "")
 
-    # Score A morts : critique séparé
     dead_a = [r for r in dead if r.get("score") == "A"]
     if dead_a:
         _record("critical", "RSS", "feeds_scoreA_morts",
@@ -638,7 +698,6 @@ def check_disk_space() -> None:
             _record("ok", "Disque", "espace_libre",
                     f"{free_mb} MB libres / {total_mb} MB ({used_pct}% utilisé) ✓")
 
-        # Taille output
         output_dir = Path("output")
         if output_dir.is_dir():
             output_mb = sum(
@@ -696,7 +755,6 @@ def check_last_run() -> None:
                 (" ✓" if lvl == "ok" else " — vérifier le cron"),
                 "" if lvl == "ok" else "crontab -l | grep sentinel")
 
-    # Erreurs récentes
     recent_errors = [
         ln for ln in lines[-50:]
         if any(kw in ln for kw in ("CRITICAL", "FATAL", "[ERROR]", "ERROR"))
@@ -740,8 +798,42 @@ def check_system_deps() -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# RAPPORT JSON & ALERTE EMAIL
-# ═════════════════════════════════════════════════════════════════════════════\n\ndef _save_report(report: dict) -> None:\n    """Sauvegarde atomique du rapport JSON (HC-FIX12)."""\n    Path("logs").mkdir(exist_ok=True)\n    out = Path("logs/health_report.json")\n    tmp = out.with_suffix(".tmp")\n    try:\n        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")\n        tmp.replace(out)\n        log.info(f"Rapport JSON sauvegardé : {out}")\n    except OSError as e:\n        log.warning(f"Impossible de sauvegarder rapport JSON : {e}")\n\n\ndef _send_alert_email(report: dict) -> None:\n    """HC-FIX13 — Alerte email si erreurs critiques + SMTP configuré."""\n    smtp_user = os.environ.get("SMTP_USER", "")\n    smtp_pass = os.environ.get("SMTP_PASS", "") or os.environ.get("SMTP_PASSWORD", "")\n    report_to = os.environ.get("REPORT_EMAIL", smtp_user)\n    if not smtp_user or not smtp_pass or not report_to:\n        return\n    criticals = [r for r in _results if r["level"] == "critical"]\n    if not criticals:\n        return\n    lines = [f"SENTINEL v{VERSION} — HealthCheck : {len(criticals)} erreur(s) critique(s)\n"]\n    lines += [f"  [FAIL] [{r['category']}] {r['name']}: {r['message']}"\n              for r in criticals[:10]]\n    if len(criticals) > 10:\n        lines.append(f"  ... et {len(criticals) - 10} autres erreurs")\n    lines.append(f"\nRapport complet : logs/health_report.json")\n    msg = MIMEText("\n".join(lines), "plain", "utf-8")
+# RAPPORT JSON & ALERTE EMAIL (HC-FIX12 / HC-FIX13)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _save_report(report: dict) -> None:
+    """Sauvegarde atomique du rapport JSON (HC-FIX12)."""
+    Path("logs").mkdir(exist_ok=True)
+    out = Path("logs/health_report.json")
+    tmp = out.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(out)
+        log.info(f"Rapport JSON sauvegardé : {out}")
+    except OSError as e:
+        log.warning(f"Impossible de sauvegarder rapport JSON : {e}")
+
+
+def _send_alert_email(report: dict) -> None:
+    """HC-FIX13 — Alerte email si erreurs critiques + SMTP configuré."""
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "") or os.environ.get("SMTP_PASSWORD", "")
+    report_to = os.environ.get("REPORT_EMAIL", smtp_user)
+    if not smtp_user or not smtp_pass or not report_to:
+        return
+    criticals = [r for r in _results if r["level"] == "critical"]
+    if not criticals:
+        return
+    lines = [f"SENTINEL v{VERSION} — HealthCheck : {len(criticals)} erreur(s) critique(s)
+"]
+    lines += [f"  [FAIL] [{r['category']}] {r['name']}: {r['message']}"
+              for r in criticals[:10]]
+    if len(criticals) > 10:
+        lines.append(f"  ... et {len(criticals) - 10} autres erreurs")
+    lines.append("
+Rapport complet : logs/health_report.json")
+    msg = MIMEText("
+".join(lines), "plain", "utf-8")
     msg["Subject"] = f"SENTINEL HealthCheck — {len(criticals)} erreur(s) critique(s)"
     msg["From"]    = smtp_user
     msg["To"]      = report_to
@@ -775,34 +867,24 @@ def _print_summary() -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# POINT D'ENTRÉE PRINCIPAL
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-
-# =============================================================================
 # M3-FIX — TEST DE NORMALITÉ SHAPIRO-WILK + SEUIL ADAPTATIF
-# Après 60 jours de données, vérifie si la distribution des indices est
-# gaussienne. Si non-gaussienne (p<0.05), recommande un seuil percentile.
-# F4-FIX — TESTS DE RÉGRESSION ANALYTIQUE MENSUELS
-# =============================================================================
+# F4-FIX  — TESTS DE RÉGRESSION ANALYTIQUE MENSUELS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def check_distribution_normality() -> None:
     """
     M3-FIX : teste la normalité des indices d'activité via Shapiro-Wilk.
-    Si non-gaussien : recommande un seuil percentile 95 empirique.
-    F4-FIX : compare la structure JSON des deltas pour détecter les dérives.
+    POST-FIX5 : _record("info", ...) correctement géré — plus de faux critique.
     """
     try:
         from db_manager import SentinelDB
         metrics = SentinelDB.getmetrics(ndays=90)
         indices = [float(m["indice"]) for m in metrics if m.get("indice")]
 
-        # M-06-FIX : Shapiro-Wilk peu fiable pour n<30 (utiliser n>=30)
         if len(indices) < 30:
             _record("info", "Statistiques", "normalite",
-                    f"Données insuffisantes ({len(indices)} points — min 30 requis pour Shapiro-Wilk fiable)",
-                    "Relancer après 30 jours de production. Pour n<50, Lilliefors (scipy.stats.kstest) est plus robuste.")
+                    f"Données insuffisantes ({len(indices)} points — min 30 requis)",
+                    "Relancer après 30 jours de production.")
             return
 
         try:
@@ -823,16 +905,12 @@ def check_distribution_normality() -> None:
             else:
                 _record("warning", "Statistiques", "normalite",
                         f"Distribution NON-gaussienne (Shapiro p={p_value:.3f} < 0.05). "
-                        f"Seuil Shewhart {shewhart_threshold:.2f} potentiellement inexact. "
-                        f"Seuil percentile P95={empirical_p95:.2f} recommandé. "
-                        f"Alternative : scipy.stats.kstest (Lilliefors) plus adapté pour n<50.",
-                        f"M3-FIX + M-06-FIX : définir SENTINEL_ALERT_SIGMA_MODE=percentile dans .env "
-                        f"pour basculer sur le seuil empirique P95={empirical_p95:.2f}")
+                        f"Seuil P95={empirical_p95:.2f} recommandé.",
+                        "Définir SENTINEL_ALERT_SIGMA_MODE=percentile dans .env")
 
         except ImportError:
             _record("info", "Statistiques", "normalite",
-                    "scipy absent — test Shapiro-Wilk désactivé (pip install scipy)",
-                    "Optionnel mais recommandé après 60j de production")
+                    "scipy absent — test Shapiro-Wilk désactivé (pip install scipy)")
 
     except Exception as exc:
         _record("warning", "Statistiques", "normalite", f"Erreur : {exc}")
@@ -840,100 +918,110 @@ def check_distribution_normality() -> None:
 
 def check_regression_analytique() -> None:
     """
-    F4-FIX : vérifie que la structure des deltas mémoire est cohérente
-    sur les 7 derniers rapports (détecte les dérives de modèle Claude).
+    F4-FIX : vérifie la cohérence des données mémoire sur 7 jours.
+
+    POST-FIX6 : corrige la fausse alerte permanente.
+    Avant : cherchait 'nouvelles_tendances' dans reports.compressed qui contient
+    json.dumps(metrics) — jamais les clés mémoire → ratio 100% → fausse alerte.
+    Après : lit directement les tables tendances et alertes (insérées par
+    SentinelDB.savetendance() et SentinelDB.ouvrirealerte() dans sentinel_main.py).
     """
     try:
         from db_manager import SentinelDB
+
         reports = SentinelDB.getrecentreports(ndays=7)
         if len(reports) < 3:
             _record("info", "Régression", "deltas",
-                    "Moins de 3 rapports — test de régression ignoré")
+                    f"Moins de 3 rapports ({len(reports)}) — test de régression ignoré")
             return
 
-        import json as _json
-        empty_delta_count = 0
-        for r in reports:
-            compressed = r.get("compressed", "{}")
-            try:
-                data = _json.loads(compressed) if isinstance(compressed, str) else {}
-                nouvelles = data.get("nouvelles_tendances", [])
-                alertes   = data.get("alertes_ouvertes", [])
-                if not nouvelles and not alertes:
-                    empty_delta_count += 1
-            except Exception:
-                empty_delta_count += 1
+        db_path = Path(os.environ.get("SENTINEL_DB", "data/sentinel.db"))
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn.row_factory = sqlite3.Row
 
-        ratio = empty_delta_count / len(reports)
-        if ratio > 0.7:
+        try:
+            tendances_7j = conn.execute(
+                "SELECT COUNT(*) FROM tendances WHERE date >= date('now', '-7 days')"
+            ).fetchone()[0]
+            alertes_7j = conn.execute(
+                "SELECT COUNT(*) FROM alertes "
+                "WHERE date_ouverture >= date('now', '-7 days')"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        total_delta = tendances_7j + alertes_7j
+
+        if total_delta == 0:
             _record("warning", "Régression", "deltas",
-                    f"F4 {int(ratio*100)}% des rapports récents ont des deltas mémoire vides. "
-                    "Possible dérive du modèle Claude ou prompt dégradé.",
-                    "Vérifier manuellement les 3 derniers rapports HTML dans output/")
+                    f"F4 Aucune tendance ni alerte sur 7 jours "
+                    f"({len(reports)} rapports analysés). "
+                    "Possible dérive du modèle Claude ou bloc DEBUTJSONDELTA absent.",
+                    "Vérifier les 3 derniers rapports HTML dans output/ et s'assurer "
+                    "que prompts/system.txt contient DEBUTJSONDELTA")
         else:
             _record("ok", "Régression", "deltas",
-                    f"F4 Deltas mémoire cohérents ({len(reports) - empty_delta_count}/{len(reports)} non-vides)")
+                    f"F4 Mémoire active : {tendances_7j} tendance(s) + "
+                    f"{alertes_7j} alerte(s) sur 7j ✓")
 
     except Exception as exc:
         _record("warning", "Régression", "deltas", f"F4 Erreur : {exc}")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE PRINCIPAL
+# ═════════════════════════════════════════════════════════════════════════════
+
 def run_health_check() -> int:
     t0  = time.monotonic()
     now = datetime.now(timezone.utc).isoformat()
     log.info("=" * 60)
-    log.info(f"SENTINEL v{VERSION} — HealthCheck démarré")
-    log.info(f"Mode : {'offline' if OFFLINE else 'online':10s} | CI : {CI_MODE}")
+    log.info(f"SENTINEL v{VERSION} — HealthCheck démarré ({now})")
+    log.info(f"Mode : {'OFFLINE' if OFFLINE else 'ONLINE'}"
+             f"{' | CI' if CI_MODE else ''}"
+             f"{' | FEEDS-ONLY' if FEEDS_ONLY else ''}"
+             f"{' | DB-ONLY' if DB_ONLY else ''}")
     log.info("=" * 60)
 
-    check_python()
-    check_packages()
-    check_structure()
-    check_env_vars()
-    check_disk_space()
-    db_stats = check_sqlite()
-
-    if not OFFLINE:
-        check_anthropic_api()
-        check_tavily()
-        check_smtp()
-
-    feed_results: list[dict] = []
-    if not OFFLINE:
-        feed_results = check_rss_feeds(verbose=FEEDS_ONLY)
-
-    check_last_run()
-    check_distribution_normality()  # M3-FIX : test Shapiro-Wilk
-    check_regression_analytique()   # F4-FIX : détection dérive modèle
-    check_system_deps()
+    if FEEDS_ONLY:
+        check_rss_feeds(verbose=True)
+    elif DB_ONLY:
+        check_sqlite()
+    else:
+        check_python()
+        check_packages()
+        check_structure()
+        check_env_vars()
+        check_sqlite()
+        if not OFFLINE:
+            check_anthropic_api()
+            check_tavily()
+            check_smtp()
+            check_rss_feeds(verbose=not CI_MODE)
+        check_disk_space()
+        check_last_run()
+        check_system_deps()
+        check_distribution_normality()
+        check_regression_analytique()
 
     elapsed = time.monotonic() - t0
-    report  = {
-        "version":      VERSION,
-        "timestamp":    now,
-        "elapsed_s":    round(elapsed, 2),
-        "offline_mode": OFFLINE,
-        "summary": {
-            "ok":       sum(1 for r in _results if r["level"] == "ok"),
-            "warnings": _warning_count,
-            "critical": _critical_count,
-        },
-        "checks":   _results,
-        "db_stats": db_stats,
-        "feeds": {
-            "total": len(feed_results),
-            "alive": sum(1 for r in feed_results if r["ok"]),
-            "dead":  [r for r in feed_results if not r["ok"]],
-        } if feed_results else {},
-    }
+    _print_summary()
+    log.info(f"Durée : {elapsed:.1f}s")
 
+    report = {
+        "version":        VERSION,
+        "ts":             now,
+        "elapsed_s":      round(elapsed, 2),
+        "critical_count": _critical_count,
+        "warning_count":  _warning_count,
+        "ok_count":       sum(1 for r in _results if r["level"] == "ok"),
+        "results":        _results,
+    }
     _save_report(report)
-    if not OFFLINE and not CI_MODE:
+
+    if not OFFLINE:
         _send_alert_email(report)
 
-    _print_summary()
-
-    # Exit codes CI/CD (HC-FIX5)
     if _critical_count > 0:
         return 2
     if _warning_count > 0:
@@ -941,20 +1029,5 @@ def run_health_check() -> int:
     return 0
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MODES SPÉCIAUX
-# ═════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    if FEEDS_ONLY:
-        check_python()
-        check_packages()
-        check_rss_feeds(verbose=True)
-        _print_summary()
-        sys.exit(2 if _critical_count else 1 if _warning_count else 0)
-    elif DB_ONLY:
-        check_sqlite()
-        _print_summary()
-        sys.exit(2 if _critical_count else 0)
-    else:
-        sys.exit(run_health_check())
+    sys.exit(run_health_check())
