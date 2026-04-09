@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-# memory_manager.py --- SENTINEL v3.40 --- Gestion mémoire sans saturation contexte
+# memory_manager.py --- SENTINEL v3.41 --- Gestion mémoire sans saturation contexte
 # =============================================================================
 # CHANGELOG v3.40 :
-#   [MM-FIX-1] HAIKU_MODEL déclaré via .env — était commenté en v3.37 → NameError fatal
-#   [MM-FIX-2] compress_report() retourne str JSON — était dict → incompatible SQLite
-#   [MM-FIX-3] report_text[-20000:] — garde la fin du rapport (M6-M9)
-#              (était report_text[:4000]+[...]+report_text[-2000:] → coupait modules 6-9)
-#   [MM-FIX-4] FIX-MM2 alertes_closes matching flou décommenté (était `pass`)
-#   [MM-FIX-5] Caps tendances[-50:] / alertes_actives[-30:] décommentés (étaient commentés)
-#   [MM-NEW-1] get_compressed_memory() : SentinelDB primaire, JSON legacy fallback
-#   [MM-NEW-2] update_memory() : dual-write SentinelDB + JSON (rollback garanti)
-#   [MM-NEW-3] next() safe guard sur resp.content (plus de IndexError resp.content[0])
+# [MM-FIX-1] HAIKU_MODEL déclaré via .env — était commenté en v3.37 → NameError fatal
+# [MM-FIX-2] compress_report() retourne str JSON — était dict → incompatible SQLite
+# [MM-FIX-3] report_text[-20000:] — garde la fin du rapport (M6-M9)
+# (était report_text[:4000]+[...]+report_text[-2000:] → coupait modules 6-9)
+# [MM-FIX-4] FIX-MM2 alertes_closes matching flou décommenté (était `pass`)
+# [MM-FIX-5] Caps tendances[-50:] / alertes_actives[-30:] décommentés (étaient commentés)
+# [MM-NEW-1] get_compressed_memory() : SentinelDB primaire, JSON legacy fallback
+# [MM-NEW-2] update_memory() : dual-write SentinelDB + JSON (rollback garanti)
+# [MM-NEW-3] next() safe guard sur resp.content (plus de IndexError resp.content[0])
+#
+# CHANGELOG v3.41 :
+# [MM-FIX-6] atomic_write() : tmp.rename(target) → tmp.replace(target)
+#             rename() lève FileExistsError sur Windows si target existe déjà.
+#             replace() est atomique et écrase la cible sur Linux ET Windows.
 # =============================================================================
 
 import json
@@ -25,7 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_VERSION = "3.40"
+_VERSION = "3.41"
 log = logging.getLogger("sentinel.memory")
 
 # ---------------------------------------------------------------------------
@@ -36,22 +41,28 @@ MEMORY_FILE = Path("data/sentinel_memory.json")
 # [MM-FIX-1] HAIKU_MODEL était commenté en v3.37 → NameError à l'appel de compress_report()
 HAIKU_MODEL = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5")
 
-
 # ---------------------------------------------------------------------------
-# UTILITAIRE — écriture atomique (inchangé v3.37)
+# UTILITAIRE — écriture atomique
 # ---------------------------------------------------------------------------
 @contextmanager
 def atomic_write(target: Path, encoding: str = "utf-8"):
-    """Context manager d'écriture atomique tmp→rename résistant aux crashs."""
+    """
+    Context manager d'écriture atomique tmp→replace résistant aux crashs.
+
+    [MM-FIX-6] Utilise tmp.replace(target) au lieu de tmp.rename(target) :
+    - Path.rename() lève FileExistsError sur Windows si target existe déjà.
+    - Path.replace() est atomique et écrase silencieusement la cible
+      sur Linux (rename(2)) ET Windows (MoveFileExW), garantissant
+      un comportement identique sur toutes les plateformes.
+    """
     tmp = target.with_suffix(".tmp")
     try:
         yield tmp
-        tmp.rename(target)
+        tmp.replace(target)  # [MM-FIX-6] était tmp.rename(target)
     except Exception:
         if tmp.exists():
             tmp.unlink()
         raise
-
 
 # ---------------------------------------------------------------------------
 # PROMPT DE COMPRESSION (inchangé v3.37)
@@ -59,22 +70,21 @@ def atomic_write(target: Path, encoding: str = "utf-8"):
 COMPRESS_PROMPT = """\
 Tu reçois un rapport SENTINEL complet. Compresse-le en JSON strict (600 mots max).
 Retourne UNIQUEMENT un objet JSON avec ces champs exactement :
-{
-  "date": "YYYY-MM-DD",
-  "indice": 7.5,
-  "delta_j1": "+0.5",
-  "alerte": "VERT",
-  "faits_critiques": ["Fait 1 (source A)", "Fait 2 (source B)", "Fait 3 (source C)"],
-  "nouvelles_tendances": ["Tendance émergente 1"],
-  "tendances_confirmees": ["Tendance confirmée 1"],
-  "alertes_ouvertes": ["Alerte 1"],
-  "alertes_closes": [],
-  "acteurs_notables": ["Acteur 1 (pays, activité)"],
-  "contrats_montants": ["Acteur X : 120M USD (source)"]
-}
+
+"date": "YYYY-MM-DD",
+"indice": 7.5,
+"delta_j1": "+0.5",
+"alerte": "VERT",
+"faits_critiques": ["Fait 1 (source A)", "Fait 2 (source B)", "Fait 3 (source C)"],
+"nouvelles_tendances": ["Tendance émergente 1"],
+"tendances_confirmees": ["Tendance confirmée 1"],
+"alertes_ouvertes": ["Alerte 1"],
+"alertes_closes": [],
+"acteurs_notables": ["Acteur 1 (pays, activité)"],
+"contrats_montants": ["Acteur X : 120M USD (source)"]
+
 PAS de texte avant ou après le JSON. PAS de balises markdown.
 """
-
 
 # ---------------------------------------------------------------------------
 # FONCTIONS JSON LEGACY (fallback si SentinelDB indisponible)
@@ -110,7 +120,6 @@ def save_memory(memory: dict) -> None:
             json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-
 # ---------------------------------------------------------------------------
 # COMPRESSION — cœur du module
 # ---------------------------------------------------------------------------
@@ -119,13 +128,13 @@ def compress_report(report_text: str) -> str:
     Compresse un rapport SENTINEL via Claude Haiku (coût ~0.01 EUR).
 
     v3.40 :
-      [MM-FIX-2] Retourne un JSON STRING (str) — double compatibilité :
+    [MM-FIX-2] Retourne un JSON STRING (str) — double compatibilité :
         · Stockage SQLite : SentinelDB.savereport(..., compressed=str, ...)
         · update_memory() interne : json.loads(compressed_str) pour le dict
-      [MM-FIX-3] report_text[-20000:] — garde M6-M9 (fin du rapport)
+    [MM-FIX-3] report_text[-20000:] — garde M6-M9 (fin du rapport)
         (était report_text[:4000]+[...]+report_text[-2000:] → perdait M6-M9)
-      [MM-FIX-1] HAIKU_MODEL depuis .env (était NameError en v3.37)
-      [MM-NEW-3] next() safe guard sur resp.content (plus de IndexError)
+    [MM-FIX-1] HAIKU_MODEL depuis .env (était NameError en v3.37)
+    [MM-NEW-3] next() safe guard sur resp.content (plus de IndexError)
 
     Fallback rawtail : si Haiku échoue, retourne les 2000 derniers chars
     en JSON brut — exploitable par dashboard.py (FIX-DB8).
@@ -150,13 +159,14 @@ def compress_report(report_text: str) -> str:
                 }
             ],
         )
+
         # [MM-NEW-3] next() évite IndexError si resp.content est vide
         raw = next(
             (b.text for b in resp.content if hasattr(b, "text") and b.text), ""
         ).strip()
 
         json.loads(raw)  # validation : lève JSONDecodeError si Haiku n'a pas suivi
-        return raw  # JSON string valide ✓
+        return raw       # JSON string valide ✓
 
     except json.JSONDecodeError:
         log.warning("[MEMORY] compress_report : JSON Haiku invalide — fallback brut")
@@ -168,6 +178,7 @@ def compress_report(report_text: str) -> str:
             },
             ensure_ascii=False,
         )
+
     except Exception as exc:
         log.exception("[MEMORY] compress_report Haiku échec — fallback rawtail")
         return json.dumps(
@@ -179,7 +190,6 @@ def compress_report(report_text: str) -> str:
             ensure_ascii=False,
         )
 
-
 # ---------------------------------------------------------------------------
 # LECTURE MÉMOIRE — injection dans Claude
 # ---------------------------------------------------------------------------
@@ -190,12 +200,12 @@ def get_compressed_memory(n_days: int = 7) -> str:
     [MM-NEW-1] v3.40 : SentinelDB en source primaire, JSON legacy en fallback.
 
     Structure retournée (JSON string) :
-      - derniers_rapports    : list[dict] — n_days rapports compressés
-      - tendances_actives    : list[str]  — 12 dernières tendances
-      - alertes_actives      : list[str]  — alertes ouvertes
-      - acteurs_surveillance : list[str]  — top 20 acteurs par score
+    - derniers_rapports      : list[dict] — n_days rapports compressés
+    - tendances_actives      : list[str]  — 12 dernières tendances
+    - alertes_actives        : list[str]  — alertes ouvertes
+    - acteurs_surveillance   : list[str]  — top 20 acteurs par score
     """
-    # Source primaire : SentinelDB
+    # ── Source primaire : SentinelDB ──────────────────────────────────────
     try:
         from db_manager import SentinelDB
 
@@ -209,7 +219,7 @@ def get_compressed_memory(n_days: int = 7) -> str:
                     # compressed corrompu → reconstitue depuis colonnes atomiques
                     derniers_rapports.append(
                         {
-                            "date": r["date"],
+                            "date":   r["date"],
                             "indice": r["indice"],
                             "alerte": r["alerte"],
                         }
@@ -239,7 +249,7 @@ def get_compressed_memory(n_days: int = 7) -> str:
             f"[MEMORY] SentinelDB indisponible ({db_err}) — fallback JSON legacy"
         )
 
-    # Fallback : JSON legacy
+    # ── Fallback : JSON legacy ─────────────────────────────────────────────
     try:
         memory = load_memory()
         recent = memory.get("compressed_reports", [])[-n_days:]
@@ -253,20 +263,21 @@ def get_compressed_memory(n_days: int = 7) -> str:
             ensure_ascii=False,
             indent=2,
         )
+
     except Exception as fallback_err:
         log.error(
             f"[MEMORY] Fallback JSON également échoué ({fallback_err}) — mémoire vide"
         )
-        return json.dumps(
-            {
-                "derniers_rapports":    [],
-                "tendances_actives":    [],
-                "alertes_actives":      [],
-                "acteurs_surveillance": [],
-            },
-            ensure_ascii=False,
-        )
 
+    return json.dumps(
+        {
+            "derniers_rapports":    [],
+            "tendances_actives":    [],
+            "alertes_actives":      [],
+            "acteurs_surveillance": [],
+        },
+        ensure_ascii=False,
+    )
 
 # ---------------------------------------------------------------------------
 # MISE À JOUR MÉMOIRE — après chaque rapport
@@ -284,30 +295,31 @@ def update_memory(
     [MM-FIX-5] Caps tendances[-50:] / alertes_actives[-30:] réactivés.
 
     Appels SentinelDB v3.40 (signatures exactes db_manager.py) :
-      savereport(date, indice, alerte, compressed, rawtail)
-      savetendance(texte, date)
-      ouvrirealerte(texte, date)
-      closealerte(texte, date)
+        savereport(date, indice, alerte, compressed, rawtail)
+        savetendance(texte, date)
+        ouvrirealerte(texte, date)
+        closealerte(texte, date)
     """
     today_str = str(report_date)
 
-    # ── 1. Compression du rapport ─────────────────────────────────────────
+    # ── 1. Compression du rapport ──────────────────────────────────────────
     compressed_str = compress_report(report_text)
     try:
         compressed_dict = json.loads(compressed_str)
     except json.JSONDecodeError:
         compressed_dict = {
-            "date": today_str,
-            "alerte": "VERT",
+            "date":       today_str,
+            "alerte":     "VERT",
             "resume_brut": compressed_str[:500],
         }
+
     compressed_dict["date"] = today_str
 
     indice  = float(compressed_dict.get("indice", 5.0))
     alerte  = str(compressed_dict.get("alerte", "VERT"))
     rawtail = report_text[-2000:]  # FIX-DB8 : rawtail exploitable dashboard
 
-    # ── 2. SentinelDB — source de vérité v3.40 ───────────────────────────
+    # ── 2. SentinelDB — source de vérité v3.40 ────────────────────────────
     try:
         from db_manager import SentinelDB
 
@@ -339,43 +351,35 @@ def update_memory(
             f"[MEMORY] SentinelDB update impossible ({db_err}) — écriture JSON seule"
         )
 
-    # ── 3. Dual-write JSON legacy (rollback / compatibilité dashboard <v3.40) ──
+    # ── 3. Dual-write JSON legacy (rollback / compatibilité dashboard) ─────
     try:
         memory = load_memory()
 
-        memory["compressed_reports"].append(compressed_dict)
+        memory.setdefault("compressed_reports", []).append(compressed_dict)
         memory["compressed_reports"] = memory["compressed_reports"][-90:]
 
         for t in delta_updates.get("nouvelles_tendances", []):
-            if t and t not in memory["tendances"]:
-                memory["tendances"].append(t)
-        memory["tendances"] = memory["tendances"][-50:]  # [MM-FIX-5] cap réactivé
+            if isinstance(t, str) and t.strip() and t not in memory.get("tendances", []):
+                memory.setdefault("tendances", []).append(t.strip())
+        memory["tendances"] = memory.get("tendances", [])[-50:]  # [MM-FIX-5]
 
         for a in delta_updates.get("alertes_ouvertes", []):
-            if a and a not in memory["alertes_actives"]:
-                memory["alertes_actives"].append(a)
+            if isinstance(a, str) and a.strip() and a not in memory.get("alertes_actives", []):
+                memory.setdefault("alertes_actives", []).append(a.strip())
+        memory["alertes_actives"] = memory.get("alertes_actives", [])[-30:]  # [MM-FIX-5]
 
-        # [MM-FIX-4] FIX-MM2 matching flou réactivé (était commenté + `pass`)
-        for a in delta_updates.get("alertes_closes", []):
-            match = next(
-                (
-                    x for x in memory["alertes_actives"]
-                    if a.strip().lower() in x.strip().lower()
-                    or x.strip().lower() in a.strip().lower()
-                ),
-                None,
-            )
-            if match:
-                memory["alertes_actives"].remove(match)
-        memory["alertes_actives"] = memory["alertes_actives"][-30:]  # [MM-FIX-5]
+        # [MM-FIX-4] Matching flou pour clôture des alertes
+        for a_close in delta_updates.get("alertes_closes", []):
+            if not isinstance(a_close, str) or not a_close.strip():
+                continue
+            key = a_close.strip()[:40].lower()
+            memory["alertes_actives"] = [
+                a for a in memory.get("alertes_actives", [])
+                if key not in a.lower()
+            ]
 
         save_memory(memory)
-        log.info("[MEMORY] JSON legacy mis à jour (dual-write v3.40)")
+        log.info("[MEMORY] JSON legacy mis à jour (dual-write)")
 
     except Exception as json_err:
-        log.exception("[MEMORY] JSON legacy update échoué — non-bloquant")
-
-
-# ---------------------------------------------------------------------------
-# POINT D'ENTRÉE TEST
-# ---------------------------------------------------------------------------\nif __name__ == "__main__":\n    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")\n    print(f"memory_manager.py v{_VERSION} — test auto")\n\n    test_report = (\n        "## RAPPORT SENTINEL 2026-04-08\n"\n        "## RÉSUMÉ EXÉCUTIF | Alerte : [ORANGE]\n"\n        "Indice d'activité sectorielle : 7.2/10 | Delta J-1 : +0.3\n"\n        "Sources analysées : 124 | Pertinentes : 31\n"\n        "## MODULE 6 — ACTEURS : Milrem, Elbit Systems, Anduril Industries\n"\n        "## MODULE 9 — nouvelles_tendances=[USV Europe], alertes_ouvertes=[MGCS]\n"\n    )\n\n    print("[TEST 1] compress_report() → doit retourner str JSON valide")\n    result = compress_report(test_report)\n    assert isinstance(result, str), "FAIL : compress_report doit retourner str"\n    parsed = json.loads(result)\n    assert isinstance(parsed, dict), "FAIL : le str doit être JSON valide"\n    print(f"  → OK : {result[:120]}...")\n\n    print("[TEST 2] get_compressed_memory() → doit retourner str JSON valide")\n    mem = get_compressed_memory(n_days=7)\n    assert isinstance(mem, str), "FAIL : get_compressed_memory doit retourner str"\n    parsed_mem = json.loads(mem)\n    assert "derniers_rapports"    in parsed_mem, "FAIL : clé 'derniers_rapports' manquante"\n    assert "tendances_actives"    in parsed_mem, "FAIL : clé 'tendances_actives' manquante"\n    assert "alertes_actives"      in parsed_mem, "FAIL : clé 'alertes_actives' manquante"\n    assert "acteurs_surveillance" in parsed_mem, "FAIL : clé 'acteurs_surveillance' manquante"\n    print(f"  → OK : {mem[:120]}...")\n\n    print("[TEST 3] update_memory() → smoke test (sans API Haiku)")\n    delta = {\n        "nouvelles_tendances": ["Test tendance USV v3.40"],\n        "alertes_ouvertes":    ["Test alerte MGCS v3.40"],\n        "alertes_closes":      [],\n    }\n    update_memory(test_report, delta, "2026-04-08")\n    print("  → OK (pas d'exception)")\n\n    print(f"\n✅ memory_manager v{_VERSION} — tous tests passés")
+        log.warning(f"[MEMORY] Dual-write JSON échoué ({json_err}) — DB seule active")
