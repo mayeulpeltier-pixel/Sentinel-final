@@ -1,4 +1,4 @@
-# db_manager.py --- SENTINEL v3.48 --- Gestionnaire SQLite WAL
+# db_manager.py --- SENTINEL v3.50 --- Gestionnaire SQLite WAL
 # =============================================================================
 # CORRECTIONS v3.40 :
 # BUG-DB1  UNIQUE sur reports.date → ON CONFLICT(date) fonctionnel
@@ -40,10 +40,47 @@
 # DB-48-RPT  get_last_n_reports(n) : méthode pour run_monthly_report()
 #            Retourne les N derniers rapports (date + rawtail) triés DESC.
 #            Distinct de getrecentreports() qui filtre par fenêtre temporelle.
+#
+# MODIFICATIONS v3.49 — Export CSV analytiques :
+# CSV-1  export_csv() dans SentinelDB — séparation de responsabilités.
+#        L'export des données brutes appartient à db_manager.py (source
+#        de vérité), PAS à charts.py (génération d'images).
+# CSV-2  Trois exports : metrics (ndays), acteurs (top N), tendances actives.
+# CSV-3  Opt-in via SENTINEL_EXPORT_CSV=1 dans .env — zéro overhead si inactif.
+#        Appelé depuis sentinel_main.py après generate_all_charts() :
+#            if os.environ.get("SENTINEL_EXPORT_CSV","0") == "1":
+#                csv_exports = _timed("csv_export", SentinelDB.export_csv)
+# CSV-4  Retourne dict[str, Path] → mailer.py joint les CSV au mail
+#        avec la même mécanique que les PNG/PDF.
+# CSV-5  Poids garanti minimal : texte pur, typiquement < 50 Ko pour 30j.
+# CSV-6  Nommage daté YYYY-MM-DD_sentinel_{nom}.csv — cohérent avec
+#        la convention de charts.py (CHK-8) : YYYY-MM-DD_{name}.png.
+# CSV-7  Fallback gracieux par export : une erreur sur un dataset n'annule
+#        pas les autres. Une erreur sur un format n'annule pas l'autre.
+# CSV-8  Bilan consolidé : taille totale et nb fichiers loggés en fin.
+#
+# MODIFICATIONS v3.50 — Double format standard / Excel FR :
+# CSV-9  Double export par dataset : standard (dataviz) + excel_fr (Excel FR).
+#        Deux configs déclaratives → une seule boucle d'écriture par dataset.
+#        Nommage : YYYY-MM-DD_sentinel_{nom}.csv        (standard)
+#                  YYYY-MM-DD_sentinel_{nom}_excel.csv  (Excel FR)
+# CSV-10 _fr_row() : float → str avec virgule décimale pour Excel FR.
+#        Appliqué uniquement au format excel_fr — le format standard
+#        conserve le point décimal natif Python (pandas, numpy, etc.).
+# CSV-11 utf-8-sig (BOM) pour excel_fr uniquement → Excel détecte
+#        automatiquement l'encodage sans assistant d'importation.
+#        Le format standard reste utf-8 pur (BOM parasite sous Linux/pandas).
+# CSV-12 SENTINEL_CSV_MODE=[both|standard|excel] dans .env
+#        Défaut : both → les deux formats générés à chaque cycle.
+#        "standard" → dataviz uniquement (CI, serveurs sans Excel)
+#        "excel"    → excel_fr uniquement (poste analyste standalone)
+#        Chargement SQL : 1 seule requête par dataset, partagée entre
+#        les deux formats — zéro surcharge DB.
 # =============================================================================
 # Compatibilité pipeline v3.37 totalement préservée (API SentinelDB inchangée)
 # =============================================================================
 
+import csv
 import json
 import logging
 import os
@@ -69,16 +106,48 @@ _DB_INITIALIZED = False
 _DB_INIT_LOCK   = threading.Lock()
 _thread_local   = threading.local()
 
-# DB-48-COL — ajout "github_days_back" à la whitelist savemetrics()
+# DB-48-COL — whitelist savemetrics()
 _ALLOWED_METRIC_COLS = frozenset({
     "indice", "alerte", "nb_articles", "nb_pertinents",
     "geousa", "geoeurope", "geoasie", "geomo", "georussie",
     "terrestre", "maritime", "transverse", "contractuel",
-    "github_days_back",    # DB-48-COL
+    "github_days_back",
 })
 
+# CSV-3 — configuration export (partagée avec sentinel_main.py via .env)
+# SENTINEL_EXPORT_CSV=1       active l'export (défaut : désactivé)
+# SENTINEL_CSV_DAYS=30        fenêtre temporelle metrics (défaut : 30j)
+# SENTINEL_CSV_ACTEURS_MAX=50 top N acteurs exportés (défaut : 50)
+# SENTINEL_CSV_MODE=both      both | standard | excel (défaut : both)
+_CSV_DAYS        = int(os.environ.get("SENTINEL_CSV_DAYS",        "30"))
+_CSV_ACTEURS_MAX = int(os.environ.get("SENTINEL_CSV_ACTEURS_MAX", "50"))
+_CSV_MODE        = os.environ.get("SENTINEL_CSV_MODE", "both")  # CSV-12
+
+# CSV-9 — configs déclaratives des formats d'export
+# Ajouter un format ici suffit, export_csv() s'adapte automatiquement.
+_CSV_EXPORT_CONFIGS = [
+    {
+        "key_suffix":  "",          # clé retournée : "metrics", "acteurs"...
+        "file_suffix": "",          # suffixe fichier : sentinel_metrics.csv
+        "delimiter":   ",",
+        "decimal_sep": ".",         # float natif Python — pandas/Grafana/numpy
+        "encoding":    "utf-8",     # pas de BOM — compatible Linux/macOS/pandas
+        "modes":       {"both", "standard"},
+        "label":       "standard",
+    },
+    {
+        "key_suffix":  "_excel",
+        "file_suffix": "_excel",
+        "delimiter":   ";",
+        "decimal_sep": ",",         # virgule décimale → nombres calculables Excel FR
+        "encoding":    "utf-8-sig", # BOM → Excel détecte UTF-8 sans assistant
+        "modes":       {"both", "excel"},
+        "label":       "excel_fr",
+    },
+]
+
 # ---------------------------------------------------------------------------
-# DDL v3.48 — schéma complet 6 tables
+# DDL v3.48 — schéma complet 6 tables (inchangé v3.50)
 # ---------------------------------------------------------------------------
 _DDL = """
 PRAGMA journal_mode = WAL;
@@ -144,7 +213,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     maritime         REAL,
     transverse       REAL,
     contractuel      REAL,
-    github_days_back INTEGER DEFAULT 0    -- DB-48-DDL
+    github_days_back INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_date
@@ -178,7 +247,7 @@ def _create_connection() -> sqlite3.Connection:
                 conn.executescript(_DDL)
                 conn.commit()
                 _DB_INITIALIZED = True
-                log.info("DB schéma initialisé (v3.48)")
+                log.info("DB schéma initialisé (v3.50)")
     return conn
 
 
@@ -216,6 +285,24 @@ def getdb():
             pass
         log.error(f"DB rollback : {exc}", exc_info=True)
         raise
+
+# ---------------------------------------------------------------------------
+# HELPERS CSV — module-level (non méthodes de classe)
+# ---------------------------------------------------------------------------
+
+def _fr_row(row: dict, decimal_sep: str) -> dict:
+    """
+    [CSV-10] Normalise les valeurs numériques pour un format d'export donné.
+    decimal_sep="." → identité (standard, pandas/numpy).
+    decimal_sep="," → float Python écrits avec virgule (Excel FR).
+    Seuls les float sont transformés — int, str, None passent tels quels.
+    """
+    if decimal_sep == ".":
+        return row  # format standard : aucune transformation
+    return {
+        k: str(v).replace(".", decimal_sep) if isinstance(v, float) else v
+        for k, v in row.items()
+    }
 
 # ---------------------------------------------------------------------------
 # CLASSE PRINCIPALE — API publique compatible v3.37
@@ -494,8 +581,8 @@ class SentinelDB:
     def getmetrics(ndays: int = 30) -> list:
         """
         [DB-48-SEL] COALESCE(github_days_back, 0) garantit 0 sur les lignes
-        antérieures à v3.48 (NULL en base, DEFAULT 0 non rétroactif sur les
-        lignes existantes).
+        antérieures à v3.48 (NULL en base, DEFAULT 0 non rétroactif sur
+        les lignes existantes).
         """
         with getdb() as db:
             rows = db.execute(
@@ -511,6 +598,169 @@ class SentinelDB:
                 (f"-{ndays} days",),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # EXPORT CSV — CSV-1 à CSV-12                                         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def export_csv(
+        ndays:         int  = _CSV_DAYS,
+        limit_acteurs: int  = _CSV_ACTEURS_MAX,
+        output_dir:    Path = Path("output"),
+    ) -> dict:
+        """
+        [CSV-1] Export des données brutes en CSV légers pour les analystes.
+
+        Séparation de responsabilités (CSV-1) :
+            L'export appartient à db_manager.py (source de vérité).
+            charts.py consomme les données — il ne les possède pas et
+            ne doit pas les exporter. Toute modification du schéma
+            SQLite se répercute automatiquement dans l'export sans
+            toucher charts.py.
+
+        Opt-in (CSV-3) : appelé depuis sentinel_main.py uniquement si
+            SENTINEL_EXPORT_CSV=1 dans .env — zéro overhead sinon.
+            Bloc à insérer dans sentinel_main.py après generate_all_charts() :
+
+                csv_exports: dict = {}
+                if os.environ.get("SENTINEL_EXPORT_CSV", "0") == "1":
+                    try:
+                        csv_exports = _timed("csv_export", SentinelDB.export_csv)
+                        logger.info(f"CSV exportés : {list(csv_exports.keys())}")
+                    except Exception as e:
+                        logger.warning(f"Export CSV non bloquant : {e}")
+
+        Génère jusqu'à 6 fichiers selon SENTINEL_CSV_MODE (CSV-12) :
+            YYYY-MM-DD_sentinel_metrics.csv          → pandas, Grafana, Superset
+            YYYY-MM-DD_sentinel_metrics_excel.csv    → Excel FR (double-clic)
+            YYYY-MM-DD_sentinel_acteurs.csv
+            YYYY-MM-DD_sentinel_acteurs_excel.csv
+            YYYY-MM-DD_sentinel_tendances.csv
+            YYYY-MM-DD_sentinel_tendances_excel.csv
+
+        Différences standard vs excel_fr (CSV-9 à CSV-11) :
+            ┌──────────────┬─────────────┬──────────────┐
+            │              │  standard   │  excel_fr    │
+            ├──────────────┼─────────────┼──────────────┤
+            │ délimiteur   │     ,       │     ;        │
+            │ décimale     │    7.2      │    7,2       │
+            │ encodage     │   utf-8     │  utf-8-sig   │
+            │ BOM          │    non      │    oui       │
+            └──────────────┴─────────────┴──────────────┘
+
+        Chargement SQL (CSV-12) : 1 seule requête par dataset, partagée
+            entre les deux formats — zéro surcharge DB.
+
+        Retourne dict[str, Path] (CSV-4) :
+            exports["metrics"]          → Path standard
+            exports["metrics_excel"]    → Path excel_fr
+            ... etc.
+
+        Fallback par export (CSV-7) : une erreur sur un dataset n'annule
+            pas les autres. Une erreur sur un format n'annule pas l'autre.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        today   = datetime.now().strftime("%Y-%m-%d")
+        exports: dict = {}
+
+        # Configs actives selon SENTINEL_CSV_MODE
+        active_configs = [
+            cfg for cfg in _CSV_EXPORT_CONFIGS
+            if _CSV_MODE in cfg["modes"]
+        ]
+        if not active_configs:
+            log.warning(
+                f"CSV export : SENTINEL_CSV_MODE='{_CSV_MODE}' invalide "
+                f"(valeurs acceptées : both, standard, excel) — export annulé"
+            )
+            return exports
+
+        # ── Datasets à exporter ───────────────────────────────────────────
+        datasets = [
+            {
+                "name":          "metrics",
+                "loader":        lambda: SentinelDB.getmetrics(ndays=ndays),
+                "empty_warning": f"table vide ou ndays={ndays} trop court",
+            },
+            {
+                "name":          "acteurs",
+                "loader":        lambda: SentinelDB.getacteurs(limit=limit_acteurs),
+                "empty_warning": "aucun acteur en base",
+            },
+            {
+                "name":          "tendances",
+                "loader":        lambda: SentinelDB.gettendancesactives(limit=200),
+                "empty_warning": "aucune tendance active en base",
+            },
+        ]
+
+        total_rows_written = 0
+
+        for dataset in datasets:
+            name = dataset["name"]
+
+            # Chargement unique — partagé entre les deux formats (CSV-12)
+            try:
+                rows = dataset["loader"]()
+            except Exception as e:
+                log.error(f"CSV {name} chargement échec : {e}", exc_info=True)
+                continue  # CSV-7 : on passe au dataset suivant
+
+            if not rows:
+                log.warning(f"CSV {name} : {dataset['empty_warning']}")
+                continue
+
+            fieldnames = list(rows[0].keys())
+
+            # Écriture dans chaque format actif
+            for cfg in active_configs:
+                key  = f"{name}{cfg['key_suffix']}"
+                path = output_dir / f"{today}_sentinel_{name}{cfg['file_suffix']}.csv"
+
+                try:
+                    with open(path, "w", newline="", encoding=cfg["encoding"]) as f:
+                        writer = csv.DictWriter(
+                            f,
+                            fieldnames = fieldnames,
+                            delimiter  = cfg["delimiter"],
+                        )
+                        writer.writeheader()
+                        writer.writerows(
+                            _fr_row(r, cfg["decimal_sep"]) for r in rows
+                        )
+
+                    size_kb = path.stat().st_size // 1024
+                    exports[key] = path
+                    total_rows_written += len(rows)
+                    log.info(
+                        f"CSV [{cfg['label']}] {name} : "
+                        f"{len(rows)} lignes → {path.name} ({size_kb} Ko)"
+                    )
+                except Exception as e:
+                    log.error(
+                        f"CSV [{cfg['label']}] {name} écriture échec : {e}",
+                        exc_info=True,
+                    )
+                    # CSV-7 : l'autre format du même dataset continue
+
+        # ── Bilan consolidé (CSV-8) ───────────────────────────────────────
+        if exports:
+            total_kb = sum(p.stat().st_size for p in exports.values()) // 1024
+            log.info(
+                f"CSV export terminé ({_CSV_MODE}) : "
+                f"{len(exports)} fichiers, "
+                f"{total_rows_written} lignes écrites, "
+                f"{total_kb} Ko total → {output_dir}/"
+            )
+        else:
+            log.warning(
+                "CSV export : aucun fichier généré "
+                "(base vide ? lancer quelques cycles de collecte)"
+            )
+
+        return exports
 
     # ------------------------------------------------------------------ #
     # MAINTENANCE — PERF-DB2 FIX + DB41-FIX1                              #
@@ -724,7 +974,7 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
         return False
 
 # ---------------------------------------------------------------------------
-# SMOKE TESTS v3.48
+# SMOKE TESTS v3.50
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -749,9 +999,9 @@ if __name__ == "__main__":
 
         # DB-48-RPT : get_last_n_reports()
         last_n = SentinelDB.get_last_n_reports(5)
-        assert len(last_n) == 1,               "DB-48-RPT : get_last_n_reports KO"
-        assert "rawtail" in last_n[0],         "DB-48-RPT : rawtail absente"
-        assert "date"    in last_n[0],         "DB-48-RPT : date absente"
+        assert len(last_n) == 1,       "DB-48-RPT : get_last_n_reports KO"
+        assert "rawtail" in last_n[0], "DB-48-RPT : rawtail absente"
+        assert "date"    in last_n[0], "DB-48-RPT : date absente"
 
         # BUG-DB2 : purge syntaxe valide
         SentinelDB.saveseen({"h1", "h2"}, source="Test")
@@ -779,11 +1029,9 @@ if __name__ == "__main__":
         assert metrics2[0]["github_days_back"] == 10, \
             "DB-48-COL/SEL : github_days_back KO"
 
-        # DB-48-SEL : COALESCE → 0 si NULL (ligne sans github_days_back)
-        yesterday = (datetime.now().replace(hour=0) .strftime("%Y-%m-%d")
-                     .replace(today[:10], "2000-01-01"))
+        # DB-48-SEL : COALESCE → 0 si NULL
         SentinelDB.savemetrics("2000-01-01", indice=5.0, alerte="VERT")
-        old_rows = [r for r in SentinelDB.getmetrics(ndays=365*30)
+        old_rows = [r for r in SentinelDB.getmetrics(ndays=365 * 30)
                     if r["date"] == "2000-01-01"]
         assert old_rows[0]["github_days_back"] == 0, \
             "DB-48-SEL : COALESCE NULL → 0 KO"
@@ -802,6 +1050,56 @@ if __name__ == "__main__":
         alertes2 = SentinelDB.getalertesactives()
         assert len(alertes2) == 1, "DB41-FIX6 : doublon alerte détecté"
 
+        # CSV-9 à CSV-12 : double format standard + excel_fr
+        SentinelDB.savetendance("Essaims FPV Ukraine", today)
+        SentinelDB.savetendance("UGV NATO interopérabilité", today)
+        csv_out = Path(tmpdir) / "csv_test"
+
+        # Test mode "both" (défaut)
+        os.environ["SENTINEL_CSV_MODE"] = "both"
+        exports_both = SentinelDB.export_csv(
+            ndays=30, limit_acteurs=10, output_dir=csv_out
+        )
+        assert "metrics"          in exports_both, "CSV-9 : metrics standard absent"
+        assert "metrics_excel"    in exports_both, "CSV-9 : metrics_excel absent"
+        assert "acteurs"          in exports_both, "CSV-9 : acteurs standard absent"
+        assert "acteurs_excel"    in exports_both, "CSV-9 : acteurs_excel absent"
+        assert "tendances"        in exports_both, "CSV-9 : tendances standard absent"
+        assert "tendances_excel"  in exports_both, "CSV-9 : tendances_excel absent"
+
+        # Vérification décimales : standard → "." / excel → ","
+        with open(exports_both["metrics"],       encoding="utf-8")     as f:
+            std_content = f.read()
+        with open(exports_both["metrics_excel"], encoding="utf-8-sig") as f:
+            xl_content  = f.read()
+        assert "7.2" in std_content, "CSV-10 : décimale standard KO"
+        assert "7,2" in xl_content,  "CSV-10 : décimale excel_fr KO"
+
+        # Vérification BOM utf-8-sig (CSV-11)
+        with open(exports_both["metrics_excel"], "rb") as f:
+            bom = f.read(3)
+        assert bom == b"ï»¿", "CSV-11 : BOM utf-8-sig absent"
+
+        # Vérification nommage daté (CSV-6)
+        assert exports_both["metrics"].name.startswith(today),       "CSV-6 : nommage standard KO"
+        assert exports_both["metrics_excel"].name.startswith(today), "CSV-6 : nommage excel KO"
+
+        # Test mode "standard" — uniquement les fichiers sans _excel
+        os.environ["SENTINEL_CSV_MODE"] = "standard"
+        exports_std = SentinelDB.export_csv(
+            ndays=30, limit_acteurs=10, output_dir=csv_out
+        )
+        assert "metrics"       in exports_std,     "CSV-12 : standard mode KO"
+        assert "metrics_excel" not in exports_std, "CSV-12 : excel généré en mode standard"
+
+        # Test mode "excel" — uniquement les fichiers _excel
+        os.environ["SENTINEL_CSV_MODE"] = "excel"
+        exports_xl = SentinelDB.export_csv(
+            ndays=30, limit_acteurs=10, output_dir=csv_out
+        )
+        assert "metrics_excel" in exports_xl,  "CSV-12 : excel mode KO"
+        assert "metrics"       not in exports_xl, "CSV-12 : standard généré en mode excel"
+
         # PERF-DB1 : closedb thread-local
         closedb()
         assert getattr(_thread_local, "conn", None) is None, "PERF-DB1 : leak connexion"
@@ -810,14 +1108,19 @@ if __name__ == "__main__":
 
         print("
 " + "=" * 60)
-        print("✅ Tous les smoke tests v3.48 passent.")
-        print(f"   Rapports       : {len(reports)}")
-        print(f"   get_last_n(5)  : {len(last_n)}")
-        print(f"   Acteurs        : {len(acteurs)}")
-        print(f"   Métriques      : {len(metrics)}")
-        print(f"   github_days_back persisté : {metrics2[0]['github_days_back']}")
-        print(f"   Alertes actives: {len(alertes2)}")
-        print(f"   Seenhashes     : {len(seen)}")
+        print("✅ Tous les smoke tests v3.50 passent.")
+        print(f"   Rapports          : {len(reports)}")
+        print(f"   get_last_n(5)     : {len(last_n)}")
+        print(f"   Acteurs           : {len(acteurs)}")
+        print(f"   Métriques         : {len(metrics)}")
+        print(f"   github_days_back  : {metrics2[0]['github_days_back']}")
+        print(f"   Alertes actives   : {len(alertes2)}")
+        print(f"   Seenhashes        : {len(seen)}")
+        print(f"   CSV mode=both     : {list(exports_both.keys())}")
+        print(f"   CSV mode=standard : {list(exports_std.keys())}")
+        print(f"   CSV mode=excel    : {list(exports_xl.keys())}")
+        csv_total_kb = sum(p.stat().st_size for p in exports_both.values()) // 1024
+        print(f"   CSV poids total   : {csv_total_kb} Ko")
         print("=" * 60)
 
 # ---------------------------------------------------------------------------
