@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# report_builder.py — SENTINEL v3.42
+# report_builder.py — SENTINEL v3.43
 # Rapport HTML complet avec graphiques
 # ─────────────────────────────────────────────────────────────────────────────
 # Corrections v3.40 (originales) :
@@ -24,9 +24,9 @@
 # Corrections v3.41 :
 #   RB-41-FIX1  img_to_svg_or_b64 définie (NameError en production)
 #   RB-41-FIX2  Signature build_html_report + compatibilité sentinel_main.py
-#   RB-41-FIX3  markdown_to_html : \u0001 → \u0001 (backreferences groupes regex)
+#   RB-41-FIX3  markdown_to_html : \u0001 backreferences groupes regex
 #   RB-41-FIX4  markdown_to_html : ** échappé pour gras/italique
-#   RB-41-FIX5  markdown_to_html : <ul>g<0></ul> (était "g<0>" invalide)
+#   RB-41-FIX5  markdown_to_html : <ul>\u0001</ul>
 #   RB-41-FIX6  markdown_to_html : |.+| échappé dans regex tableau
 #   RB-41-FIX7  _build_toc : d+ au lieu de d+
 #   RB-41-FIX8  _md_table : [s|:=-] au lieu de [s|:=-]
@@ -38,6 +38,48 @@
 #   RB-42-FIX1  markdown_to_html : regex <li> re.S → re.M (fusion de listes corrigée)
 #   RB-42-FIX2  markdown_to_html : nettoyage caractères invisibles Unicode en entrée
 #   RB-42-FIX3  CSS @media print : orphans/widows ajoutés sur p et li
+#
+# MODIFICATIONS v3.43 — Bandeau d'avertissement light mode mailer :
+#   RB-43-WARN1  build_light_mode_warning_part() — fonction utilitaire exportée.
+#                Génère un MIMEText HTML d'avertissement à injecter dans le
+#                message MIME allégé quand mailer.py retire des pièces jointes
+#                (light mode CSV ou PDF).
+#
+#                Pourquoi dans report_builder.py et non mailer.py ?
+#                  Séparation des responsabilités :
+#                  - report_builder.py possède le style HTML/CSS de l'email
+#                    (couleurs, polices, structure MIME) — c'est lui qui sait
+#                    comment styler un bandeau d'alerte cohérent avec le rapport.
+#                  - mailer.py possède la logique d'envoi et de dégradation —
+#                    il sait QUAND déclencher le warning, pas COMMENT le styler.
+#                  Mettre le HTML inline dans mailer.py casse cette séparation
+#                  et duplique les constantes de style (couleurs, layout).
+#
+#                Usage dans mailer.py — _strip_csv_attachments() :
+#                    from report_builder import build_light_mode_warning_part
+#                    light_msg.attach(
+#                        build_light_mode_warning_part(["CSV"], _ATTACH_LIMIT_MB)
+#                    )
+#
+#                Usage dans mailer.py — _strip_pdf_attachments() :
+#                    from report_builder import build_light_mode_warning_part
+#                    light_msg.attach(
+#                        build_light_mode_warning_part(["PDF"], _ATTACH_LIMIT_MB)
+#                    )
+#
+#                Usage combiné (CSV + PDF retirés) :
+#                    light_msg.attach(
+#                        build_light_mode_warning_part(["CSV", "PDF"], _ATTACH_LIMIT_MB)
+#                    )
+#
+#                Le MIMEText retourné est text/html utf-8, attaché au message
+#                MIME en dernier — les clients mail l'affichent avant le corps
+#                du rapport, signalant clairement la dégradation.
+#
+#   RB-43-WARN2  _WARN_CSS inline dans build_light_mode_warning_part() —
+#                styles isolés, sans dépendance au template _HTML_TEMPLATE.
+#                Le bandeau est autonome : il s'affiche même si le HTML du
+#                rapport n'est pas joint (cas blocage total).
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -129,7 +171,7 @@ def _md_table(m: re.Match) -> str:
     rows = [
         r.strip() for r in m.group(0).strip().split("
 ")
-        if r.strip() and not re.match(r"^[s|:=-]+$", r.strip())  # RB-41-FIX8
+        if r.strip() and not re.match(r"^[s|:=-]+$", r.strip())
     ]
     if not rows:
         return ""
@@ -154,11 +196,11 @@ def markdown_to_html(text: str) -> str:  # noqa: C901
     Gère : h1/h2/h3 avec ancres module-N, gras, listes (ul wrapping),
     tables Markdown, badge NON VÉRIFIÉ, sauts de paragraphe.
 
-    RB-41-FIX3 : \u0001 (était \u0001 → caractère de contrôle Unicode)
-    RB-41-FIX4 : ** et * échappés (non échappés = quantificateurs regex)
-    RB-41-FIX5 : g<0> correct (était "g<0>" invalide)
-    RB-41-FIX6 : |.+| échappé (| non échappé = alternance vide)
-    RB-42-FIX1 : re.M au lieu de re.S sur la regex <li> (évite fusion de listes)
+    RB-41-FIX3 : \\1 (backreferences groupes regex)
+    RB-41-FIX4 : \\*\\* et \\* échappés (non échappés = quantificateurs regex)
+    RB-41-FIX5 : \\1 correct
+    RB-41-FIX6 : \\|.+\\| échappé (| non échappé = alternance vide)
+    RB-42-FIX1 : re.M au lieu de re.S sur la regex <li>
     RB-42-FIX2 : nettoyage caractères invisibles Unicode en entrée
     """
     # RB-42-FIX2 : suppression des caractères invisibles injectés par Claude / Tavily
@@ -172,35 +214,28 @@ def markdown_to_html(text: str) -> str:  # noqa: C901
     )
 
     # ── Titres avec ancres module-N (A14-FIX) ─────────────────────────────
-    text = re.sub(r"^# (.+)$", r"<h1>\u0001</h1>", text, flags=re.M)  # RB-41-FIX3
+    text = re.sub(r"^# (.+)$",   r"<h1>\u0001</h1>",   text, flags=re.M)
+    text = re.sub(r"^### (.+)$", r"<h3>\u0001</h3>",   text, flags=re.M)
 
     def _h2_with_anchor(m: re.Match) -> str:
         title = m.group(1)
-        mod_m = re.match(r"MODULE (d+)", title)  # RB-41-FIX7 : d+ (était d+)
+        mod_m = re.match(r"MODULEs+(d+)", title, re.IGNORECASE)
         if mod_m:
             return f'<h2 id="module-{mod_m.group(1)}">{title}</h2>'
         return f"<h2>{title}</h2>"
 
     text = re.sub(r"^## (.+)$", _h2_with_anchor, text, flags=re.M)
-    text = re.sub(r"^### (.+)$", r"<h3>\u0001</h3>", text, flags=re.M)  # RB-41-FIX3
 
     # ── Gras / italique ───────────────────────────────────────────────────
-    # RB-41-FIX4 : ** et * échappés
     text = re.sub(r"**(.+?)**", r"<strong>\u0001</strong>", text)
     text = re.sub(r"*(.+?)*",     r"<em>\u0001</em>",         text)
 
     # ── Tables Markdown → HTML (VIS-6) ────────────────────────────────────
-    # RB-41-FIX6 : |.+| échappé
     text = re.sub(r"(|.+|
 ?)+", _md_table, text, flags=re.M)
 
     # ── Listes à puces (R5A3-NEW-5 ul wrapping) ──────────────────────────
     text = re.sub(r"^[-*] (.+)$", r"<li>\u0001</li>", text, flags=re.M)
-    # RB-42-FIX1 : re.M au lieu de re.S — re.S faisait franchir les paragraphes
-    #              à .*? et fusionnait plusieurs listes distinctes en un seul <ul>.
-    #              re.M confine la capture ligne par ligne.
-    # RB-41-FIX5 : \u0001 correct (était g<0> → groupe 0 = match entier, redondant mais OK ;
-    #              \u0001 = groupe 1, plus précis)
     text = re.sub(r"((?:<li>.*?</li>
 ?)+)", r"<ul>\u0001</ul>", text, flags=re.M)
 
@@ -235,7 +270,7 @@ _HTML_TEMPLATE = """\
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="dark light">
-<meta name="generator" content="SENTINEL v3.42">
+<meta name="generator" content="SENTINEL v3.43">
 <meta name="robots" content="noindex, nofollow">
 <meta property="og:title" content="SENTINEL – Veille Robotique Défense">
 <meta property="og:description" content="Rapport de veille automatisé – Robotique défense">
@@ -369,7 +404,7 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
 
 %%ALERTE_BANNER%%
 
-<h1>SENTINEL v3.42 &mdash; Rapport du %%DATE%%</h1>
+<h1>SENTINEL v3.43 &mdash; Rapport du %%DATE%%</h1>
 
 %%TOC%%
 
@@ -378,7 +413,7 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
 %%REPORT_BODY%%
 
 <div class="footer">
-  SENTINEL v3.42 &bull; Généré le %%TIMESTAMP%% &bull; Budget ~5 &euro;/mois
+  SENTINEL v3.43 &bull; Généré le %%TIMESTAMP%% &bull; Budget ~5 &euro;/mois
 </div>
 
 <script>
@@ -444,7 +479,7 @@ def _build_alerte_banner(report_text: str) -> str:
 def _build_toc(report_text: str = "") -> str:
     """
     Construit la TOC depuis les ## MODULE N détectés dans report_text.
-    RB-41-FIX7  : d+ au lieu de d+
+    RB-41-FIX7  : \\d+ au lieu de d+
     RB-41-FIX10 : import re local supprimé
     """
     items = []
@@ -615,6 +650,122 @@ def _inject_metrics_banner(report_text: str) -> str:
     except Exception as e:
         log.debug(f"BUILDER metrics_banner non disponible : {e}")
         return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANDEAU AVERTISSEMENT LIGHT MODE — RB-43-WARN1 / RB-43-WARN2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_light_mode_warning_part(
+    stripped_types: list[str],
+    limit_mb:       int  = 24,
+    output_path:    str  = "output/",
+) -> MIMEText:
+    """
+    [RB-43-WARN1] Génère un MIMEText HTML d'avertissement à injecter dans
+    le message MIME allégé lorsque mailer.py retire des pièces jointes
+    (light mode CSV ou PDF, ou les deux).
+
+    Paramètres
+    ----------
+    stripped_types : list[str]  Types retirés, ex. ["CSV"], ["PDF"], ["CSV", "PDF"].
+    limit_mb       : int        Limite SMTP ayant déclenché le light mode
+                                (SMTP_ATTACH_LIMIT_MB). Affiché dans le message.
+    output_path    : str        Chemin serveur où récupérer les fichiers retirés.
+                                Configurable via SENTINEL_OUTPUT_URL dans .env
+                                pour les destinataires externes (ex. URL SFTP).
+
+    Retourne
+    --------
+    MIMEText HTML utf-8 prêt à attacher à light_msg via light_msg.attach().
+
+    Intégration mailer.py — _strip_csv_attachments() :
+        from report_builder import build_light_mode_warning_part
+        light_msg.attach(
+            build_light_mode_warning_part(["CSV"], _ATTACH_LIMIT_MB)
+        )
+
+    Intégration mailer.py — _strip_pdf_attachments() :
+        from report_builder import build_light_mode_warning_part
+        light_msg.attach(
+            build_light_mode_warning_part(["PDF"], _ATTACH_LIMIT_MB)
+        )
+
+    Intégration mailer.py — _check_message_size() (étape 3b, CSV+PDF retirés) :
+        from report_builder import build_light_mode_warning_part
+        light_msg.attach(
+            build_light_mode_warning_part(["CSV", "PDF"], _ATTACH_LIMIT_MB)
+        )
+
+    [RB-43-WARN2] Styles inline isolés — aucune dépendance à _HTML_TEMPLATE.
+    Le bandeau s'affiche même si le HTML du rapport n'est pas joint
+    (cas blocage total où seul le texte plain est envoyé).
+    """
+    # Labels lisibles par type retiré
+    _LABELS: dict[str, str] = {
+        "CSV": "fichiers CSV analytiques (.csv)",
+        "PDF": "rapport PDF complet (.pdf)",
+    }
+    stripped_labels = [_LABELS.get(t.upper(), t) for t in stripped_types]
+    items_html      = "".join(f"<li>{lbl}</li>" for lbl in stripped_labels)
+
+    # Couleur du bandeau : orange si CSV seul (dégradation légère),
+    # rouge si PDF retiré (livrable principal absent)
+    has_pdf    = any(t.upper() == "PDF" for t in stripped_types)
+    bg_color   = "#C00000" if has_pdf else "#9C6500"
+    border_clr = "#8B0000" if has_pdf else "#7A5000"
+    icon       = "🔴" if has_pdf else "🟠"
+
+    html = f"""\
+<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:system-ui,'Segoe UI',Arial,sans-serif;
+             background:#f8f9fa;padding:0;margin:0;">
+
+  <div style="
+    background:{bg_color};
+    border-left:6px solid {border_clr};
+    border-radius:6px;
+    padding:14px 20px;
+    margin:0 0 16px 0;
+    color:#ffffff;
+    font-size:14px;
+    line-height:1.6;
+  ">
+    <p style="margin:0 0 8px 0;font-size:15px;font-weight:700;letter-spacing:.03em;">
+      {icon}&nbsp; SENTINEL — Email allégé (limite SMTP {limit_mb} Mo dépassée)
+    </p>
+    <p style="margin:0 0 6px 0;">
+      La taille de cet email dépassait la limite configurée.
+      Les pièces jointes suivantes ont été <strong>automatiquement retirées</strong> :
+    </p>
+    <ul style="margin:4px 0 8px 24px;padding:0;">
+      {items_html}
+    </ul>
+    <p style="margin:0;font-size:13px;opacity:.92;">
+      📁 Récupérez-les sur le serveur dans&nbsp;
+      <code style="
+        background:rgba(0,0,0,.25);
+        padding:2px 6px;
+        border-radius:3px;
+        font-family:monospace;
+        font-size:12px;
+      ">{output_path}</code>
+      &nbsp;— tous les fichiers du cycle sont conservés 30 jours.
+    </p>
+    <p style="margin:6px 0 0 0;font-size:12px;opacity:.80;">
+      Pour envoyer les pièces jointes complètes : augmentez
+      <code style="background:rgba(0,0,0,.25);padding:1px 4px;border-radius:3px;">
+      SMTP_ATTACH_LIMIT_MB</code> dans <code style="background:rgba(0,0,0,.25);
+      padding:1px 4px;border-radius:3px;">.env</code>.
+    </p>
+  </div>
+
+</body>
+</html>"""
+
+    return MIMEText(html, "html", "utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
