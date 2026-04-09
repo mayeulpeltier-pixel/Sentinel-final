@@ -1,6 +1,8 @@
-# report_builder.py — SENTINEL v3.40 — Rapport HTML complet avec graphiques
+#!/usr/bin/env python3
+# report_builder.py — SENTINEL v3.42
+# Rapport HTML complet avec graphiques
 # ─────────────────────────────────────────────────────────────────────────────
-# Corrections v3.40 appliquées :
+# Corrections v3.40 (originales) :
 #   A13         Badge alerte VERT/ORANGE/ROUGE parsé dynamiquement
 #   A14         ToC HTML avec ancres module-N
 #   A23         alt unique par image (WCAG 2.1)
@@ -8,16 +10,34 @@
 #   B3          img_to_base64 avec try/except FileNotFoundError
 #   B10         MIME text/html + application/pdf (non octet-stream)
 #   F-5         OUTPUT_DIR via Path(__file__).parent — safe en cron
-#   R5A3-NEW-2  outpath NameError corrigé (toujours défini avant utilisation)
+#   R5A3-NEW-2  outpath NameError corrigé
 #   R5A3-NEW-3  <meta name="color-scheme"> dark light
 #   R5A3-NEW-5  ul wrapping dans markdown_to_html
-#   V-2         str.replace() au lieu de .format() — safe si JSON Claude
-#   VIS-3       WeasyPrint PDF optionnel + chemin absolu
+#   V-2         str.replace() au lieu de .format()
+#   VIS-3       WeasyPrint PDF optionnel
 #   VIS-6       Tables Markdown → HTML
 #   VIS-7       meta generator
-#   VISUAL-R1   metrics lues depuis SentinelDB (plus regex HTML)
+#   VISUAL-R1   metrics lues depuis SentinelDB
 #   VISUAL-R3   @media print CSS complet
-#   R5-NEW-3    purge_old_reports() — CDC-4
+#   R5-NEW-3    purge_old_reports()
+#
+# Corrections v3.41 :
+#   RB-41-FIX1  img_to_svg_or_b64 définie (NameError en production)
+#   RB-41-FIX2  Signature build_html_report + compatibilité sentinel_main.py
+#   RB-41-FIX3  markdown_to_html : \u0001 → \u0001 (backreferences groupes regex)
+#   RB-41-FIX4  markdown_to_html : ** échappé pour gras/italique
+#   RB-41-FIX5  markdown_to_html : <ul>g<0></ul> (était "g<0>" invalide)
+#   RB-41-FIX6  markdown_to_html : |.+| échappé dans regex tableau
+#   RB-41-FIX7  _build_toc : d+ au lieu de d+
+#   RB-41-FIX8  _md_table : [s|:=-] au lieu de [s|:=-]
+#   RB-41-FIX9  _build_charts_section : double "if not chart_paths" supprimé
+#   RB-41-FIX10 _build_toc : import re local supprimé
+#   RB-41-FIX11 _inject_metrics_banner : dict(raw) pour SQLite Row → .get() garanti
+#
+# Corrections v3.42 :
+#   RB-42-FIX1  markdown_to_html : regex <li> re.S → re.M (fusion de listes corrigée)
+#   RB-42-FIX2  markdown_to_html : nettoyage caractères invisibles Unicode en entrée
+#   RB-42-FIX3  CSS @media print : orphans/widows ajoutés sur p et li
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -44,7 +64,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # HELPERS IMAGES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# VIS-2 / A23 — map nom fichier → alt text descriptif WCAG
 _ALT_MAP: dict[str, str] = {
     "activite30j":        "Courbe activité sectorielle – robotique défense 30 derniers jours",
     "activite30j_plotly": "Courbe activité sectorielle interactive – 30 derniers jours",
@@ -78,15 +97,46 @@ def img_to_base64(path: str) -> str:
         return ""
 
 
+def img_to_svg_or_b64(path: str) -> tuple[str, str]:
+    """
+    RB-41-FIX1 : fonction manquante en v3.40 — appelée dans _render_chart()
+    mais jamais définie → NameError à chaque génération de rapport avec charts.
+
+    Retourne (contenu, format) :
+      - SVG inline si le fichier est .svg
+      - PNG base64 si le fichier est .png
+      - ('', 'png') si le fichier est absent ou illisible
+    """
+    try:
+        p = Path(path)
+        if p.suffix.lower() == ".svg":
+            return p.read_text(encoding="utf-8"), "svg"
+        return img_to_base64(path), "png"
+    except Exception as e:
+        log.warning(f"BUILDER img_to_svg_or_b64 : erreur {path} – {e}")
+        return "", "png"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKDOWN → HTML
-# ─────────────────────────────────────────────────────────────────────────────\n\ndef _md_table(m: re.Match) -> str:\n    """Convertit un bloc tableau Markdown en <table> HTML (VIS-6)."""\n    rows = [\n        r.strip() for r in m.group(0).strip().split("\n")\n        if r.strip() and not re.match(r"^[s|:=-]+$", r.strip())\n    ]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _md_table(m: re.Match) -> str:
+    """
+    Convertit un bloc tableau Markdown en <table> HTML (VIS-6).
+    RB-41-FIX8 : [s|:=-] au lieu de [s|:=-].
+    """
+    rows = [
+        r.strip() for r in m.group(0).strip().split("
+")
+        if r.strip() and not re.match(r"^[s|:=-]+$", r.strip())  # RB-41-FIX8
+    ]
     if not rows:
         return ""
     html_rows: list[str] = []
     for k, row in enumerate(rows):
         cells = [c.strip() for c in row.strip("|").split("|")]
-        tag = "th" if k == 0 else "td"
+        tag   = "th" if k == 0 else "td"
         html_rows.append(
             "<tr>" + "".join(f"<{tag}>{c}</{tag}>" for c in cells) + "</tr>"
         )
@@ -103,31 +153,71 @@ def markdown_to_html(text: str) -> str:  # noqa: C901
     Conversion Markdown basique → HTML.
     Gère : h1/h2/h3 avec ancres module-N, gras, listes (ul wrapping),
     tables Markdown, badge NON VÉRIFIÉ, sauts de paragraphe.
+
+    RB-41-FIX3 : \u0001 (était \u0001 → caractère de contrôle Unicode)
+    RB-41-FIX4 : ** et * échappés (non échappés = quantificateurs regex)
+    RB-41-FIX5 : g<0> correct (était "g<0>" invalide)
+    RB-41-FIX6 : |.+| échappé (| non échappé = alternance vide)
+    RB-42-FIX1 : re.M au lieu de re.S sur la regex <li> (évite fusion de listes)
+    RB-42-FIX2 : nettoyage caractères invisibles Unicode en entrée
     """
-    # ── Titres avec ancres module-N (A14-FIX / R5-NEW-1) ──────────────────
-    text = re.sub(r"^# (.+)$", r"<h1>\u0001</h1>", text, flags=re.M)
+    # RB-42-FIX2 : suppression des caractères invisibles injectés par Claude / Tavily
+    text = (
+        text
+        .replace('​', '')   # zero-width space
+        .replace('‌', '')   # zero-width non-joiner
+        .replace('‍', '')   # zero-width joiner
+        .replace(' ', ' ')  # espace insécable → espace normale
+        .replace('﻿', '')   # BOM UTF-8
+    )
+
+    # ── Titres avec ancres module-N (A14-FIX) ─────────────────────────────
+    text = re.sub(r"^# (.+)$", r"<h1>\u0001</h1>", text, flags=re.M)  # RB-41-FIX3
 
     def _h2_with_anchor(m: re.Match) -> str:
         title = m.group(1)
-        mod_m = re.match(r"MODULE (d+)", title)
+        mod_m = re.match(r"MODULE (d+)", title)  # RB-41-FIX7 : d+ (était d+)
         if mod_m:
             return f'<h2 id="module-{mod_m.group(1)}">{title}</h2>'
         return f"<h2>{title}</h2>"
 
     text = re.sub(r"^## (.+)$", _h2_with_anchor, text, flags=re.M)
-    text = re.sub(r"^### (.+)$", r"<h3>\u0001</h3>", text, flags=re.M)
+    text = re.sub(r"^### (.+)$", r"<h3>\u0001</h3>", text, flags=re.M)  # RB-41-FIX3
 
     # ── Gras / italique ───────────────────────────────────────────────────
+    # RB-41-FIX4 : ** et * échappés
     text = re.sub(r"**(.+?)**", r"<strong>\u0001</strong>", text)
     text = re.sub(r"*(.+?)*",     r"<em>\u0001</em>",         text)
 
-    # ── Tables Markdown → HTML (VIS-6) ────────────────────────────────────\n    text = re.sub(r"(|.+|\n?)+", _md_table, text, flags=re.M)
+    # ── Tables Markdown → HTML (VIS-6) ────────────────────────────────────
+    # RB-41-FIX6 : |.+| échappé
+    text = re.sub(r"(|.+|
+?)+", _md_table, text, flags=re.M)
 
-    # ── Listes à puces (R5A3-NEW-5 ul wrapping) ──────────────────────────\n    text = re.sub(r"^[-*] (.+)$", r"<li>\u0001</li>", text, flags=re.M)\n    text = re.sub(r"(<li>.*?</li>\n?)+", r"<ul>g<0></ul>", text, flags=re.S)
+    # ── Listes à puces (R5A3-NEW-5 ul wrapping) ──────────────────────────
+    text = re.sub(r"^[-*] (.+)$", r"<li>\u0001</li>", text, flags=re.M)
+    # RB-42-FIX1 : re.M au lieu de re.S — re.S faisait franchir les paragraphes
+    #              à .*? et fusionnait plusieurs listes distinctes en un seul <ul>.
+    #              re.M confine la capture ligne par ligne.
+    # RB-41-FIX5 : \u0001 correct (était g<0> → groupe 0 = match entier, redondant mais OK ;
+    #              \u0001 = groupe 1, plus précis)
+    text = re.sub(r"((?:<li>.*?</li>
+?)+)", r"<ul>\u0001</ul>", text, flags=re.M)
 
-    # ── Badge NON VÉRIFIÉ ─────────────────────────────────────────────────\n    text = re.sub(\n        r"NON VÉRIFIÉ[^.\n]*",\n        '<span style="color:#C00000;font-weight:bold">⚠ NON VÉRIFIÉ</span>',\n        text,\n    )
+    # ── Badge NON VÉRIFIÉ ─────────────────────────────────────────────────
+    text = re.sub(
+        r"NON VÉRIFIÉ[^.
+]*",
+        '<span style="color:#C00000;font-weight:bold">⚠ NON VÉRIFIÉ</span>',
+        text,
+    )
 
-    # ── Sauts de paragraphe ───────────────────────────────────────────────\n    text = text.replace("\n\n", "</p><p>")\n    text = re.sub(r"(?<!</p>)\n", "<br>", text)
+    # ── Sauts de paragraphe ───────────────────────────────────────────────
+    text = text.replace("
+
+", "</p><p>")
+    text = re.sub(r"(?<!</p>)
+", "<br>", text)
     return f"<p>{text}</p>"
 
 
@@ -145,7 +235,7 @@ _HTML_TEMPLATE = """\
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="dark light">
-<meta name="generator" content="SENTINEL v3.40">
+<meta name="generator" content="SENTINEL v3.42">
 <meta name="robots" content="noindex, nofollow">
 <meta property="og:title" content="SENTINEL – Veille Robotique Défense">
 <meta property="og:description" content="Rapport de veille automatisé – Robotique défense">
@@ -254,7 +344,7 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
   a{color:#7eb8f7}
 }
 
-/* ── Print / PDF (VISUAL-R3) ─────────────────────────────────────── */
+/* ── Print / PDF (VISUAL-R3 + RB-42-FIX3) ───────────────────────── */
 @media print{
   nav.toc,.no-print,.footer{display:none!important}
   body{font-size:11pt;color:#000;background:#fff;max-width:none;padding:0}
@@ -270,6 +360,8 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
   table.md-table{page-break-inside:avoid;font-size:9pt}
   a[href]::after{content:" (" attr(href) ")";font-size:.75em;color:#555}
   .chart-plotly{display:none}
+  /* RB-42-FIX3 : évite les lignes orphelines/veuves en haut ou bas de page PDF */
+  p,li{orphans:3;widows:3}
 }
 </style>
 </head>
@@ -277,7 +369,7 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
 
 %%ALERTE_BANNER%%
 
-<h1>SENTINEL v3.40 &mdash; Rapport du %%DATE%%</h1>
+<h1>SENTINEL v3.42 &mdash; Rapport du %%DATE%%</h1>
 
 %%TOC%%
 
@@ -286,11 +378,11 @@ ul{padding-left:22px;margin:8px 0 10px}li{margin-bottom:4px}
 %%REPORT_BODY%%
 
 <div class="footer">
-  SENTINEL v3.40 &bull; Généré le %%TIMESTAMP%% &bull; Budget ~5 &euro;/mois
+  SENTINEL v3.42 &bull; Généré le %%TIMESTAMP%% &bull; Budget ~5 &euro;/mois
 </div>
 
 <script>
-/* Tri colonnes tableaux MODULE 6 (V2-FIX) */
+/* Tri colonnes tableaux */
 document.querySelectorAll("table.md-table th").forEach(function(h, col) {
   h.title = "Cliquer pour trier";
   h.addEventListener("click", function() {
@@ -349,24 +441,28 @@ def _build_alerte_banner(report_text: str) -> str:
 # TABLE DES MATIÈRES (A14-FIX)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# V-03-FIX : TOC dynamique construite depuis les headings du rapport réel
 def _build_toc(report_text: str = "") -> str:
-    """Construit la TOC depuis les ## MODULE N détectés dans report_text."""
-    import re as _re
+    """
+    Construit la TOC depuis les ## MODULE N détectés dans report_text.
+    RB-41-FIX7  : d+ au lieu de d+
+    RB-41-FIX10 : import re local supprimé
+    """
     items = []
     if report_text:
-        for m in _re.finditer(
-            r"^##\s+((?:RÉSUMÉ|MODULE\s+\d+)[^\n]*)",
-            report_text, _re.MULTILINE | _re.IGNORECASE
+        for m in re.finditer(
+            r"^##s+((?:RÉSUMÉ|MODULEs+d+)[^
+]*)",
+            report_text, re.MULTILINE | re.IGNORECASE
         ):
             title = m.group(1).strip()
-            num_m = _re.search(r"MODULE\s+(\d+)", title, _re.IGNORECASE)
+            num_m = re.search(r"MODULEs+(d+)", title, re.IGNORECASE)
             if num_m:
                 anchor = f"module-{num_m.group(1)}"
             else:
                 anchor = "resume-executif"
             label = title[:45] + ("…" if len(title) > 45 else "")
             items.append((anchor, label))
+
     # Fallback statique si rapport vide
     if not items:
         items = [
@@ -381,33 +477,35 @@ def _build_toc(report_text: str = "") -> str:
     return f'<nav class="toc no-print"><strong>Navigation :</strong> {links}</nav>'
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION GRAPHIQUES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_plotly_html(p: str) -> bool:
-    """True si p est un div HTML Plotly (A25-FIX) plutôt qu'un chemin PNG."""
+    """True si p est un div HTML Plotly plutôt qu'un chemin PNG."""
     return isinstance(p, str) and p.strip().startswith("<")
 
 
 def _render_chart(p: str, full: bool = True, extra_cls: str = "") -> str:
     """
-    Rend un chart soit en <img> base64 (PNG) soit en div Plotly (HTML).
-    Retourne chaîne vide si chart invalide ou image manquante (VIS-1 guard).
+    Rend un chart soit en <img> base64/SVG soit en div Plotly (HTML).
+    Retourne chaîne vide si chart invalide ou image manquante.
+    RB-41-FIX1 : utilise img_to_svg_or_b64 désormais définie.
     """
     if not p:
         return ""
     if _is_plotly_html(p):
         cls = f"chart-plotly {extra_cls}".strip()
         return f'<div class="{cls}">{p}</div>'
+
     content_data, fmt = img_to_svg_or_b64(p)
     if not content_data:
         return ""
+
     alt      = chart_alt(p)
     wrap_cls = ("chart-full " + extra_cls).strip() if full else extra_cls.strip()
+
     if fmt == "svg":
-        # V1-FIX: SVG inline — 10x plus léger que PNG base64
         return f'<div class="{wrap_cls}" aria-label="{alt}">{content_data}</div>'
     return (
         f'<div class="{wrap_cls}">'
@@ -421,30 +519,27 @@ def _build_charts_section(chart_paths: list) -> str:  # noqa: C901
     Assemble la section visuelle.
 
     Disposition :
-      [0] activité 30j             → pleine largeur
+      [0] activité 30j         → pleine largeur
       [1] répartition géo  ┐
-      [2] radar techno     ┘       → côte à côte
-      [3] top acteurs              → pleine largeur
-      [4] heatmap acteurs          → pleine largeur
-      [5] évolution alertes        → pleine largeur
-      [6] contrats montants        → pleine largeur
-      [7] carte acteurs géo        → pleine largeur
+      [2] radar techno     ┘   → côte à côte
+      [3] top acteurs          → pleine largeur
+      [4] heatmap acteurs      → pleine largeur
+      [5] évolution alertes    → pleine largeur
+      [6] contrats montants    → pleine largeur
+      [7] carte acteurs géo    → pleine largeur
 
-    Accepte PNG paths ET divs HTML Plotly (A25-FIX).
+    RB-41-FIX9 : double "if not chart_paths" supprimé.
     """
-    # V-04-FIX : message explicatif si aucun graphique disponible
     if not chart_paths:
         return (
             '<div class="charts-empty" style="background:#f8f9fa;border:1px solid #dee2e6;'
-            'border-radius:6px;padding:20px;margin:16px 0;text-align:center;color:#6c757d;">' 
+            'border-radius:6px;padding:20px;margin:16px 0;text-align:center;color:#6c757d;">'
             '<p><strong>Graphiques non disponibles</strong></p>'
             '<p>Base de données insuffisante (premier lancement) ou erreur de génération.<br>'
             'Les graphiques apparaîtront à partir du 2e rapport.</p>'
             '</div>'
         )
 
-    if not chart_paths:
-        return ""
     valid = [p for p in chart_paths if p]
     if not valid:
         return ""
@@ -456,9 +551,8 @@ def _build_charts_section(chart_paths: list) -> str:  # noqa: C901
             parts.append(_render_chart(p, full=True))
 
         elif idx == 1:
-            # Paire géo + radar côte à côte
-            p2        = valid[2] if len(valid) > 2 else None
-            pair_cls  = "chart-plotly-pair" if (
+            p2       = valid[2] if len(valid) > 2 else None
+            pair_cls = "chart-plotly-pair" if (
                 _is_plotly_html(p) or (p2 and _is_plotly_html(p2))
             ) else "chart-grid"
             c1 = _render_chart(p,  full=False)
@@ -466,7 +560,13 @@ def _build_charts_section(chart_paths: list) -> str:  # noqa: C901
             parts.append(f'<div class="{pair_cls}">{c1}{c2}</div>')
 
         elif idx == 2:
-            pass  # déjà traité dans idx == 1\n\n        else:\n            parts.append(_render_chart(p, full=True))\n\n    return "\n".join(s for s in parts if s)
+            pass  # déjà traité dans idx == 1
+
+        else:
+            parts.append(_render_chart(p, full=True))
+
+    return "
+".join(s for s in parts if s)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,15 +576,18 @@ def _build_charts_section(chart_paths: list) -> str:  # noqa: C901
 def _inject_metrics_banner(report_text: str) -> str:
     """
     Lit les métriques du jour depuis SentinelDB et génère une ligne de KPI HTML.
-    VISUAL-R1 : remplace l'extraction regex sur le texte du rapport.
-    Dégradation gracieuse si SentinelDB indisponible.
+    VISUAL-R1   : remplace l'extraction regex sur le texte du rapport.
+    RB-41-FIX11 : dict(raw) pour SQLite Row → .get() garanti.
     """
     try:
         from db_manager import SentinelDB
         rows = SentinelDB.getmetrics(ndays=1)
         if not rows:
             return ""
-        m           = rows[0]
+
+        raw = rows[0]
+        m   = dict(raw) if not isinstance(raw, dict) else raw
+
         indice      = m.get("indice",       "–")
         alerte      = (m.get("alerte",      "VERT") or "VERT").upper()
         nb_src      = m.get("nb_articles",   "–")
@@ -493,8 +596,10 @@ def _inject_metrics_banner(report_text: str) -> str:
         maritime    = m.get("maritime",     0) or 0
         transverse  = m.get("transverse",   0) or 0
         contractuel = m.get("contractuel",  0) or 0
-        color_map   = {"VERT": "#2D6A2D", "ORANGE": "#9C6500", "ROUGE": "#C00000"}
-        color       = color_map.get(alerte, "#2D6A2D")
+
+        color_map = {"VERT": "#2D6A2D", "ORANGE": "#9C6500", "ROUGE": "#C00000"}
+        color     = color_map.get(alerte, "#2D6A2D")
+
         return (
             '<div class="exec-summary" style="display:flex;gap:24px;'
             'flex-wrap:wrap;font-size:.9em;">'
@@ -528,14 +633,17 @@ def build_html_report(
     Paramètres
     ----------
     report_text : str   Texte brut Claude (Markdown avec modules).
-    chart_paths : list  Chemins PNG ou divs HTML Plotly (peut contenir None).
-    date_obj    : date  Date du rapport.
+    chart_paths : list  Chemins PNG/SVG ou divs HTML Plotly (peut contenir None).
+    date_obj    :       Date du rapport (datetime.date ou datetime.datetime).
     output_dir  : Path  Répertoire sortie. Défaut : OUTPUT_DIR (absolu F-5).
 
-    Corrections clés
-    ----------------
-    R5A3-NEW-2  outpath défini systématiquement avant utilisation
-    V-2         str.replace() — safe sur JSON Claude avec accolades {}
+    RB-41-FIX2 : compatibilité sentinel_main.py — appeler ainsi :
+        chart_paths = generate_all_charts(report_text)
+        html_report = build_html_report(
+            report_text,
+            chart_paths or [],
+            datetime.date.today()
+        )
     """
     out_dir   = Path(output_dir) if output_dir else OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -546,11 +654,10 @@ def build_html_report(
 
     alerte_banner  = _build_alerte_banner(report_text)
     metrics_banner = _inject_metrics_banner(report_text)
-    toc            = _build_toc(report_text)  # V-03-FIX : TOC dynamique
+    toc            = _build_toc(report_text)
     charts_section = _build_charts_section(chart_paths or [])
     report_body    = metrics_banner + markdown_to_html(report_text)
 
-    # Injection via str.replace() — V-2 safe sur accolades JSON Claude
     html = (
         _HTML_TEMPLATE
         .replace("%%DATE%%",           date_str)
@@ -561,12 +668,10 @@ def build_html_report(
         .replace("%%TIMESTAMP%%",      timestamp)
     )
 
-    # Sauvegarde HTML (R5A3-NEW-2 : outpath toujours défini ici)
     out_path = out_dir / f"SENTINEL_{date_file}_rapport.html"
     out_path.write_text(html, encoding="utf-8")
     log.info(f"BUILDER Rapport HTML → {out_path.resolve()}")
 
-    # Export PDF optionnel WeasyPrint (VIS-3)
     pdf_path = out_dir / f"SENTINEL_{date_file}_rapport.pdf"
     try:
         from weasyprint import HTML as WH  # type: ignore
@@ -581,8 +686,36 @@ def build_html_report(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUILD EMAIL MESSAGE — séparé pour tests unitaires (B10-FIX)
-# ─────────────────────────────────────────────────────────────────────────────\n\ndef build_email_message(\n    date_str: str,\n    html_body: str,\n    from_addr: str,\n    to_addr: str,\n    output_dir: Optional[Path] = None,\n) -> MIMEMultipart:\n    """\n    Construit le message MIME avec pièces jointes HTML + PDF.\n    B10-FIX : MIME text/html (non application/octet-stream) pour HTML,\n              application/pdf pour PDF.\n    """\n    msg = MIMEMultipart("mixed")\n    msg["From"]    = from_addr\n    msg["To"]      = to_addr\n    msg["Subject"] = f"SENTINEL — Rapport robotique défense du {date_str}"\n\n    body = (\n        f"Bonjour,\n\n"\n        f"Veuillez trouver ci-joint le rapport SENTINEL du {date_str}.\n"\n        f"Ce rapport couvre la robotique marine et terrestre dans le domaine de la défense.\n"\n        f"Le rapport HTML peut être ouvert directement dans un navigateur.\n"\n    )
+# BUILD EMAIL MESSAGE (B10-FIX)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_email_message(
+    date_str:   str,
+    html_body:  str,
+    from_addr:  str,
+    to_addr:    str,
+    output_dir: Optional[Path] = None,
+) -> MIMEMultipart:
+    """
+    Construit le message MIME avec pièces jointes HTML + PDF.
+    B10-FIX : MIME text/html pour HTML, application/pdf pour PDF.
+    """
+    msg = MIMEMultipart("mixed")
+    msg["From"]    = from_addr
+    msg["To"]      = to_addr
+    msg["Subject"] = f"SENTINEL — Rapport robotique défense du {date_str}"
+
+    body = (
+        f"Bonjour,
+
+"
+        f"Veuillez trouver ci-joint le rapport SENTINEL du {date_str}.
+"
+        f"Ce rapport couvre la robotique marine et terrestre dans le domaine de la défense.
+"
+        f"Le rapport HTML peut être ouvert directement dans un navigateur.
+"
+    )
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     out_dir = Path(output_dir) if output_dir else OUTPUT_DIR
@@ -592,8 +725,8 @@ def build_html_report(
         date_file = date_str
 
     for suffix, m_type, m_sub in [
-        (".html", "text",        "html"),   # B10-FIX : était application/octet-stream
-        (".pdf",  "application", "pdf"),    # B10-FIX
+        (".html", "text",        "html"),
+        (".pdf",  "application", "pdf"),
     ]:
         att_path = out_dir / f"SENTINEL_{date_file}_rapport{suffix}"
         if att_path.exists():
@@ -620,7 +753,7 @@ def build_html_report(
 def purge_old_reports(days: int = 30) -> int:
     """
     Supprime HTML, PDF et PNG charts de plus de N jours dans OUTPUT_DIR.
-    Retourne le nombre de fichiers supprimés. (R5-NEW-3 / CDC-4)
+    Retourne le nombre de fichiers supprimés.
     """
     cutoff  = time.time() - days * 86400
     removed = 0
