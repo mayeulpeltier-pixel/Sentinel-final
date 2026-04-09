@@ -1,18 +1,33 @@
-# init_prompts.py — SENTINEL v3.40 — Initialisation des prompts et structure projet
+#!/usr/bin/env python3
+# init_prompts.py — SENTINEL v3.42 — Initialisation des prompts et structure projet
 # ─────────────────────────────────────────────────────────────────────────────
-# Corrections v3.40 appliquées :
+# Corrections v3.40 (originales) :
 #   E2-FIX CDC-C    CHANGELOG.md créé automatiquement
 #   R1-F2           requirements.txt généré avec versions épinglées
-#   R2-NEW-4        SCOPE.md créé (testscope_md_exists)
+#   R2-NEW-4        SCOPE.md créé
 #   FIX-OBS1        Logging structuré via logger nommé, zéro print()
 #   NEW-IP1         .env.example généré avec toutes les variables documentées
 #   NEW-IP2         Vérification idempotente — ne réécrit pas si --force absent
-#   NEW-IP3         Marqueurs prompts validés après écriture (cohérence sentinelapi.py)
-#   NEW-IP4         Structure dossiers complète créée (data/output/logs/prompts/
-#                   output/charts) cohérente avec sentinelmain.py
-#   NEW-IP5         Prompt daily : marqueur OUI|NON Tavily documenté (OSINT-6)
+#   NEW-IP3         Marqueurs prompts validés après écriture
+#   NEW-IP4         Structure dossiers complète créée
+#   NEW-IP5         Prompt daily : marqueur OUI|NON Tavily documenté
 #   CDC-C3          Prompt monthly : 8 modules obligatoires vérifiés
 #   B9-FIX          Messages d'erreur explicites si prompts manquants
+#
+# Corrections v3.41 :
+#   IP-41-FIX1  _write_file : path.parent/(name+".tmp") — with_suffix() cassait .env.example
+#   IP-41-FIX2  TAVILYMAX ajouté à REQUIRED_SYSTEM_MARKERS + validé dans _check_integrity()
+#   IP-41-FIX3  main() complétée — script était tronqué, non fonctionnel
+#   IP-41-FIX4  SENTINEL_HEALTH_PORT ajouté dans .env.example
+#   IP-41-FIX5  Double SENTINEL_MAILER_DRYRUN supprimé dans .env.example
+#   IP-41-FIX6  ANNE → ANNEE dans marqueurs et prompts
+#   IP-41-FIX7  SCOPE.md + CHANGELOG.md mis à jour v3.41/v3.42
+#   IP-41-FIX8  --force + --check mutuellement exclusifs vérifiés au démarrage
+#
+# Corrections v3.42 :
+#   IP-42-FIX1  _extract_version() + _build_scope_md() — versions lues dynamiquement
+#               depuis les scripts au lieu d'être codées en dur dans SCOPE_MD.
+#               Élimine la maintenance manuelle à chaque mise à jour de sous-script.
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage :
 #   python init_prompts.py             Initialisation initiale (skip si déjà fait)
@@ -23,7 +38,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import re
 import sys
 from pathlib import Path
 
@@ -39,7 +54,15 @@ log = logging.getLogger("sentinel.init")
 FORCE_REWRITE = "--force" in sys.argv
 CHECK_ONLY    = "--check" in sys.argv
 
-# ── Marqueurs obligatoires (cohérence sentinelapi.py) ────────────────────────
+# IP-41-FIX8 : --force et --check sont mutuellement exclusifs
+if FORCE_REWRITE and CHECK_ONLY:
+    log.error("--force et --check sont mutuellement exclusifs. Choisir l'un ou l'autre.")
+    sys.exit(1)
+
+# ── Marqueurs obligatoires (cohérence sentinel_api.py) ────────────────────────
+REQUIRED_SYSTEM_MARKERS = [
+    "TAVILYMAX",  # IP-41-FIX2 : remplacé au runtime par sentinel_api.py
+]
 REQUIRED_DAILY_MARKERS = [
     "DATEAUJOURDHUI",
     "ARTICLESFILTRSPARSCRAPER",
@@ -49,7 +72,7 @@ REQUIRED_DAILY_MARKERS = [
 ]
 REQUIRED_MONTHLY_MARKERS = [
     "MOIS",
-    "ANNE",
+    "ANNEE",       # IP-41-FIX6 : était "ANNE"
     "INJECTION30RAPPORTSCOMPRESSES",
 ]
 REQUIRED_MONTHLY_MODULES = [
@@ -61,6 +84,29 @@ REQUIRED_MONTHLY_MODULES = [
     "CARTE FINANCIÈRE",
     "POINTS D'ATTENTION",
     "RECOMMANDATIONS",
+]
+
+# ── Table des scripts du projet (IP-42-FIX1) ─────────────────────────────────
+# Chaque entrée : (chemin relatif, rôle, optionnel)
+_SCRIPT_TABLE = [
+    ("init_prompts.py",      "Initialisation structure & prompts",  False),
+    ("scraper_rss.py",       "Collecte 72 flux RSS",                False),
+    ("memory_manager.py",    "Mémoire compressée Haiku",            False),
+    ("sentinel_api.py",      "Analyse Claude Sonnet + Tavily",      False),
+    ("charts.py",            "Graphiques PNG/Plotly",               False),
+    ("report_builder.py",    "Rapport HTML + PDF",                  False),
+    ("mailer.py",            "Envoi SMTP Gmail",                    False),
+    ("sentinel_main.py",     "Orchestrateur principal",             False),
+    ("samgov_scraper.py",    "SAM.gov DoD + TED EU + BOAMP",        False),
+    ("db_manager.py",        "SQLite WAL centralisé",               False),
+    ("healthcheck.py",       "Monitoring RSS + config",             False),
+    ("watchdog.py",          "Surveillance cron + alerte email",    False),
+]
+_OPTIONAL_TABLE = [
+    ("ops_patents.py",       "Brevets Espacenet OPS",   "PRIORITÉ 2"),
+    ("telegram_scraper.py",  "Telegram militaire",      "PRIORITÉ 3"),
+    ("nlp_scorer.py",        "TF-IDF bigrammes",        "PRIORITÉ 5"),
+    ("dashboard.py",         "Interface Streamlit",     "PRIORITÉ 6"),
 ]
 
 
@@ -168,6 +214,8 @@ RÈGLES QUALITÉ
 • Utiliser uniquement la recherche web (outil websearch) pour vérifier
   les FAITS CRITIQUES uniquement (score artscore > 7.0) — maximum TAVILYMAX appels
 """.strip()
+# IP-41-FIX2 : TAVILYMAX remplacé au runtime par sentinel_api.py
+#              via os.environ.get("SENTINEL_TAVILY_MAX", "5") avant envoi à Claude.
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -229,7 +277,7 @@ Si aucun article pertinent n'est disponible pour un module :
 
 MONTHLY_PROMPT = """
 <task>RAPPORT MENSUEL SENTINEL</task>
-<periode>MOIS ANNE</periode>
+<periode>MOIS ANNEE</periode>
 
 <rapportsjournaliers>
 INJECTION30RAPPORTSCOMPRESSES
@@ -302,11 +350,11 @@ RÈGLES :
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# REQUIREMENTS.TXT (R1-F2 — versions épinglées)
+# REQUIREMENTS.TXT (R1-F2)
 # ═════════════════════════════════════════════════════════════════════════════
 
 REQUIREMENTS_TXT = """
-# SENTINEL v3.40 — Dépendances Python épinglées (R1-F2)
+# SENTINEL v3.42 — Dépendances Python épinglées (R1-F2)
 # Installer avec : pip install -r requirements.txt
 # Testé Python 3.10+ (walrus operator := requis)
 
@@ -318,11 +366,11 @@ python-dotenv>=1.0.0        # Variables d'environnement .env
 
 # ── Analyse & IA ────────────────────────────────────────────
 tavily-python>=0.3.0        # Recherche web temps réel (optionnel)
-tenacity>=8.2.0             # Retry exponentiel sentinelapi.py (optionnel)
+tenacity>=8.2.0             # Retry exponentiel sentinel_api.py (optionnel)
 openai>=1.0.0               # Fallback GPT-4o-mini (optionnel)
 
 # ── Visualisation ───────────────────────────────────────────
-matplotlib>=3.8.0           # Graphiques PNG (R6A3-NEW-5)
+matplotlib>=3.8.0           # Graphiques PNG
 plotly>=5.18.0              # Graphiques interactifs dashboard
 kaleido>=0.2.1              # Export PNG Plotly
 
@@ -331,7 +379,7 @@ weasyprint>=60.0            # PDF depuis HTML (Linux : apt libcairo2)
 schedule>=1.2.0             # Scheduler Python (alternative cron)
 
 # ── NLP scoring (optionnel — PRIORITÉ 5 A32) ────────────────
-scikit-learn>=1.3.0         # TF-IDF bigrammes nlpscorer.py
+scikit-learn>=1.3.0         # TF-IDF bigrammes nlp_scorer.py
 
 # ── Dashboard web (optionnel — PRIORITÉ 6 A25) ──────────────
 streamlit>=1.28.0           # Interface web locale dashboard.py
@@ -339,7 +387,7 @@ fastapi>=0.104.0            # API REST optionnelle
 uvicorn>=0.24.0             # Serveur ASGI FastAPI
 
 # ── Telegram scraping (optionnel — PRIORITÉ 3 A20) ──────────
-telethon>=1.30.0            # Telegram API telegramscraper.py
+telethon>=1.30.0            # Telegram API telegram_scraper.py
 
 # ── Système ─────────────────────────────────────────────────
 # Linux/RPi AVANT pip install weasyprint :
@@ -349,11 +397,11 @@ telethon>=1.30.0            # Telegram API telegramscraper.py
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# .ENV.EXAMPLE (NEW-IP1)
+# .ENV.EXAMPLE (NEW-IP1 / IP-41-FIX4 / IP-41-FIX5)
 # ═════════════════════════════════════════════════════════════════════════════
 
 ENV_EXAMPLE = """
-# SENTINEL v3.40 — Variables d'environnement
+# SENTINEL v3.42 — Variables d'environnement
 # Copier ce fichier en .env et remplir les valeurs
 # Ne jamais committer .env dans git (.gitignore obligatoire)
 
@@ -379,7 +427,6 @@ REPORT_EMAIL=destinataire@example.com
 # ── SMTP avancé (optionnel — défaut Gmail) ───────────────────
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
-SENTINEL_MAILER_DRYRUN=0
 
 # ── SAM.gov (RECOMMANDÉ — gratuit sur sam.gov/developers) ────
 SAM_GOV_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -388,8 +435,14 @@ SENTINEL_MIN_CONTRACT_USD=1000000
 # ── Base de données SQLite (optionnel — défaut : data/sentinel.db)
 SENTINEL_DB=data/sentinel.db
 
+# ── Serveur de santé (optionnel — défaut : 8765) ─────────────
+SENTINEL_HEALTH_PORT=8765
+
 # ── Circuit-breaker API (optionnel) ──────────────────────────
 SENTINEL_CB_MAX=3
+
+# ── Purge rapports (optionnel — défaut : 30 jours) ───────────
+SENTINEL_RETENTION_DAYS=30
 
 # ── Telegram (optionnel — PRIORITÉ 3) ────────────────────────
 TELEGRAM_API_ID=
@@ -405,39 +458,168 @@ SENTINEL_MAILER_DRYRUN=0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SCOPE.MD (R2-NEW-4)
+# CHANGELOG.MD (E2-FIX CDC-C)
 # ═════════════════════════════════════════════════════════════════════════════
 
-SCOPE_MD = """
-# SENTINEL v3.40 — Périmètre & Contraintes (SCOPE.md)
+CHANGELOG_MD = """
+# CHANGELOG.md — SENTINEL — Historique des versions
 
-## Périmètre livrable garanti (CDC v3.40)
+Format : `vX.Y.Z — AAAA-MM-JJ`
+Types : Ajouté | Corrigé | Modifié | Supprimé | Sécurité
 
-| Script | Rôle | Statut |
-|--------|------|--------|
-| `init_prompts.py` | Initialisation structure & prompts | ✅ |
-| `scraper_rss.py` | Collecte 72 flux RSS | ✅ |
-| `memory_manager.py` | Mémoire compressée Haiku | ✅ |
-| `sentinel_api.py` | Analyse Claude Sonnet + Tavily | ✅ |
-| `charts.py` | Graphiques PNG/Plotly | ✅ |
-| `report_builder.py` | Rapport HTML + PDF | ✅ |
-| `mailer.py` | Envoi SMTP Gmail | ✅ |
-| `sentinel_main.py` | Orchestrateur principal | ✅ |
-| `samgov_scraper.py` | SAM.gov DoD + TED EU + BOAMP | ✅ |
-| `db_manager.py` | SQLite WAL centralisé | ✅ |
-| `healthcheck.py` | Monitoring RSS + config | ✅ |
-| `watchdog.py` | Surveillance cron + alerte email | ✅ |
+---
+
+## v3.42 — 2026-04-09
+
+### Corrigé
+- `scraper_rss.py`    : SCR-42-FIX1 keywords TOML, SCR-42-FIX2 Jaccard adaptatif
+- `report_builder.py` : RB-42-FIX1 regex <li> re.S → re.M (fusion listes)
+- `report_builder.py` : RB-42-FIX2 nettoyage caractères invisibles Unicode
+- `report_builder.py` : RB-42-FIX3 orphans/widows CSS @media print
+
+### Ajouté
+- `init_prompts.py`   : IP-42-FIX1 _extract_version() + _build_scope_md() dynamiques
+
+---
+
+## v3.41 — 2026-04-09
+
+### Corrigé
+- `sentinel_main.py`  : SONNET_MODEL transmis à run_sentinel()
+- `sentinel_main.py`  : articles.extend(tg_arts or []) — garde None
+- `sentinel_main.py`  : port SENTINEL_HEALTH_PORT protégé try/except ValueError
+- `sentinel_main.py`  : spec/loader None guard dans _load_optional_scraper()
+- `report_builder.py` : RB-41-FIX1 img_to_svg_or_b64 définie (NameError)
+- `report_builder.py` : RB-41-FIX2 signature build_html_report corrigée
+- `report_builder.py` : RB-41-FIX3/4/5/6/7/8 regex markdown_to_html corrigées
+- `report_builder.py` : RB-41-FIX9/10/11 double guard, import local, SQLite Row
+- `init_prompts.py`   : IP-41-FIX1 _write_file atomicité .env.example
+- `init_prompts.py`   : IP-41-FIX2 TAVILYMAX validé
+- `init_prompts.py`   : IP-41-FIX3 main() complétée
+- `init_prompts.py`   : IP-41-FIX4/5/6/7/8 .env.example, ANNEE, versions
+
+---
+
+## v3.40 — 2026-04-09
+
+### Ajouté
+- `db_manager.py`     : BUG-DB1 à BUG-DB7 — UNIQUE, DDL, CRUD, whitelist, LIKE
+- `sentinel_api.py`   : A07-FIX call_api() hors boucle, R6-NEW-2 validation deltas
+- `mailer.py`         : B10 MIME corrects, NEW-M1/M2/M3/M5
+- `samgov_scraper.py` : FIX-SAM1/2/3/4 + NEW-SG3 run_all_procurement()
+- `init_prompts.py`   : NEW-IP1/2/3/4 .env.example, idempotence, validation
+- `report_builder.py` : A13/A14/A23/A24/B3/B10/VIS-3/6/7/VISUAL-R1/R3
+
+### Corrigé
+- Circuit-breaker cb_fail/cb_ok/cb_active consolidés
+- Logging : zéro print() dans tous les scripts
+- Retry SMTP : 3 tentatives backoff 30s/90s
+
+---
+
+## v3.37 — 2026-04-06
+
+### Ajouté
+- `watchdog.py` surveillance cron + alerte email (E1-REC1)
+- Fallback LLM GPT-4o-mini si Anthropic APIError
+- Circuit-breaker budget tokens 30k via SENTINEL_MAX_TOKENS
+- 5 flux RSS activés (CSIS, WOTR, VOA Russia, IndiaDefenceReview, 38North)
+- `db_manager.py` SQLite WAL centralisé — remplace JSON (E1-5)
+
+### Corrigé
+- tmp.rename(MEMORY_FILE) restauré — mémoire sauvegardée atomiquement
+- tavilycalls, resp = None restaurés — NameError fatal supprimé
+- chartpaths, build_html_report, send_report restaurés — pipeline complet
+- Filtre LATAM désormais actif dans scrape_one()
+
+---
+
+## v3.16 — 2026-03-15
+
+### Ajouté
+- Sources Israël, Turquie, Inde (PIB Defence, Takshashila)
+- BOAMP + TED EU dans samgov_scraper.py
+- Dark mode CSS dans report_builder.py
+- Badges alerte HTML (VERT/ORANGE/ROUGE)
+- 14 nouvelles sources OSINT critiques
+
+---
+
+## v3.12 — 2026-02-01
+
+### Ajouté
+- SQLite migration recommandée (E1-5)
+- crossreference_articles() détection événements multi-sources
+- weight_temporal() décroissance exponentielle λ=0.15
+
+### Corrigé
+- scrape_all_feeds() ThreadPoolExecutor — 10 threads max
+- seen_list écriture atomique tmp → rename (A08-FIX)
+""".strip()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _extract_version(script_path: Path) -> str:
+    """
+    IP-42-FIX1 : lit la version depuis les 10 premières lignes d'un script Python.
+    Cherche un pattern vX.YY dans les commentaires d'en-tête.
+    Retourne "?" si introuvable ou si le fichier est absent.
+
+    Exemples détectés :
+      # sentinel_main.py — SENTINEL v3.41
+      VERSION = "3.42"
+      # report_builder.py — SENTINEL v3.42
+    """
+    if not script_path.exists():
+        return "?"
+    try:
+        lines = script_path.read_text(encoding="utf-8").splitlines()[:15]
+        for line in lines:
+            m = re.search(r'[vV](d+.d+(?:.d+)?)', line)
+            if m:
+                return f"v{m.group(1)}"
+    except OSError:
+        pass
+    return "?"
+
+
+def _build_scope_md() -> str:
+    """
+    IP-42-FIX1 : génère SCOPE.md avec les versions lues dynamiquement
+    depuis les scripts présents sur le disque.
+    Élimine la maintenance manuelle à chaque mise à jour de sous-script.
+    """
+    # ── Table scripts obligatoires ────────────────────────────────────────
+    rows_required = []
+    for script, role, _ in _SCRIPT_TABLE:
+        version = _extract_version(Path(script))
+        status  = "✅" if Path(script).exists() else "⏳ À créer"
+        rows_required.append(f"| `{script}` | {role} | {version} | {status} |")
+
+    # ── Table scripts optionnels ──────────────────────────────────────────
+    rows_optional = []
+    for script, role, priority in _OPTIONAL_TABLE:
+        rows_optional.append(f"| `{script}` | {role} | {priority} |")
+
+    scope = f"""# SENTINEL — Périmètre & Contraintes (SCOPE.md)
+# Versions lues dynamiquement depuis les scripts (IP-42-FIX1)
+
+## Périmètre livrable garanti
+
+| Script | Rôle | Version | Statut |
+|--------|------|---------|--------|
+{chr(10).join(rows_required)}
 
 ## Optionnel (hors CDC)
 
 | Script | Rôle | Priorité |
 |--------|------|----------|
-| `ops_patents.py` | Brevets Espacenet OPS | PRIORITÉ 2 |
-| `telegram_scraper.py` | Telegram militaire | PRIORITÉ 3 |
-| `nlp_scorer.py` | TF-IDF bigrammes | PRIORITÉ 5 |
-| `dashboard.py` | Interface Streamlit | PRIORITÉ 6 |
+{chr(10).join(rows_optional)}
 
-## Couverture OSINT v3.40
+## Couverture OSINT
 
 | Zone | Sources primaires | Analytique | Plafond OSINT |
 |------|------------------:|:----------:|:-------------:|
@@ -469,111 +651,25 @@ SCOPE_MD = """
 - Telegram : légal via API officielle Telethon
 - SAM.gov, TED EU, BOAMP : APIs publiques officielles, gratuites
 """.strip()
+    return scope
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CHANGELOG.MD (E2-FIX CDC-C)
-# ═════════════════════════════════════════════════════════════════════════════
-
-CHANGELOG_MD = """
-# CHANGELOG.md — SENTINEL — Historique des versions
-
-Format : `vX.Y.Z — AAAA-MM-JJ`
-Types : Ajouté | Corrigé | Modifié | Supprimé | Sécurité
-
----
-
-## v3.40 — 2026-04-09
-
-### Ajouté
-- `db_manager.py` : BUG-DB1 contrainte UNIQUE sur `reports.date` (ON CONFLICT UPSERT)
-- `db_manager.py` : BUG-DB2 syntaxe SQLite correcte dans `purge_seen_older_than_days()`
-- `db_manager.py` : BUG-DB3 DDL exécuté une seule fois via flag `_DB_INITIALIZED`
-- `db_manager.py` : BUG-DB4 méthodes CRUD `acteurs` implémentées
-- `db_manager.py` : BUG-DB5 whitelist `ALLOWED_COLS` dans `save_metrics()`
-- `db_manager.py` : BUG-DB6 `get_recent_reports()` filtre temporel réel (non LIMIT)
-- `db_manager.py` : BUG-DB7 wildcards LIKE échappés dans `close_alerte()`
-- `sentinel_api.py` : A07-FIX `call_api()` définie une seule fois hors boucle agentique
-- `sentinel_api.py` : R6-NEW-2 validation schéma deltas — listes garanties
-- `sentinel_api.py` : VISUAL-R1 `extract_metrics_from_report()` → `SentinelDB.save_metrics()`
-- `mailer.py` : B10 MIME text/html + application/pdf corrects
-- `mailer.py` : NEW-M1 destinataires multiples `REPORT_EMAIL=a@b.com,c@d.com`
-- `mailer.py` : NEW-M2 mode dry-run `SENTINEL_MAILER_DRYRUN=1`
-- `mailer.py` : NEW-M3 validation adresses email avant envoi
-- `mailer.py` : NEW-M5 support TLS direct (port 465)
-- `samgov_scraper.py` : FIX-SAM1 `deptname="DEPT OF DEFENSE"` + `ptype="o,p,k"`
-- `samgov_scraper.py` : FIX-SAM2 TED API v3 POST JSON + CPV défense corrects
-- `samgov_scraper.py` : FIX-SAM3 `seen_ids` set global — zéro doublon multi-keyword
-- `samgov_scraper.py` : FIX-SAM4 `noticeId` (champ v2 correct) + `artscore=8.5`
-- `samgov_scraper.py` : NEW-SG3 `run_all_procurement()` — point d'entrée unique
-- `init_prompts.py` : NEW-IP1 `.env.example` généré avec toutes les variables
-- `init_prompts.py` : NEW-IP2 vérification idempotente + `--force` / `--check`
-- `init_prompts.py` : NEW-IP3 marqueurs prompts validés après écriture
-- `init_prompts.py` : NEW-IP4 structure dossiers complète créée
-
-### Corrigé
-- Circuit-breaker : `cb_fail()` / `cb_ok()` / `cb_active()` consolidés
-- Logging : zéro `print()` dans tous les scripts — remplacés par `log.*`
-- Retry SMTP : 3 tentatives backoff 30s/90s (K-6 / R3A3-NEW-5)
-
----
-
-## v3.37 — 2026-04-06
-
-### Ajouté
-- `watchdog.py` surveillance cron automatique + alerte email (E1-REC1)
-- Fallback LLM GPT-4o-mini si Anthropic `APIError` (E1-Réserve2)
-- Circuit-breaker budget tokens 30k via `SENTINEL_MAX_TOKENS` (E1-Réserve1)
-- 5 flux RSS activés (CSIS, WOTR, VOA Russia, IndiaDefenceReview, 38North)
-- `db_manager.py` SQLite WAL centralisé — remplace JSON (E1-5)
-
-### Corrigé
-- `tmp.rename(MEMORY_FILE)` restauré — mémoire sauvegardée atomiquement
-- `tavilycalls`, `resp = None` restaurés — NameError fatal supprimé
-- `chartpaths`, `build_html_report`, `send_report` restaurés — pipeline complet
-- Filtre LATAM désormais actif dans `scrape_one()` — bug corrigé
-
----
-
-## v3.16 — 2026-03-15
-
-### Ajouté
-- Sources Israël, Turquie, Inde (PIB Defence, Takshashila)
-- BOAMP + TED EU dans `samgov_scraper.py`
-- Dark mode CSS dans `report_builder.py`
-- Badges alerte HTML (VERT/ORANGE/ROUGE)
-- 14 nouvelles sources OSINT critiques (USNI, C4ISRNET, Army Technology...)
-
----
-
-## v3.12 — 2026-02-01
-
-### Ajouté
-- SQLite migration recommandée (E1-5)
-- `crossreference_articles()` détection événements multi-sources
-- `weight_temporal()` décroissance exponentielle λ=0.15
-
-### Corrigé
-- `scrape_all_feeds()` ThreadPoolExecutor — 10 threads max (R1A3-NEW-2)
-- `seen_list` écriture atomique `tmp → rename` (A08-FIX)
-""".strip()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# FONCTIONS UTILITAIRES
-# ═════════════════════════════════════════════════════════════════════════════
 
 def _write_file(path: Path, content: str, label: str) -> bool:
     """
     Écrit un fichier de manière atomique (tmp → rename).
     Retourne True si écriture effectuée, False si skippée.
+
+    IP-41-FIX1 : path.parent / (path.name + ".tmp") au lieu de path.with_suffix(".tmp").
+    with_suffix() remplaçait le dernier suffixe — transformait
+    Path(".env.example") → Path(".env.tmp"), cassant l'atomicité silencieusement.
+
     NEW-IP2 : idempotent — ne réécrit pas si déjà présent et --force absent.
     """
     if path.exists() and not FORCE_REWRITE:
         log.info(f"SKIP {label} — déjà présent ({path}) — utiliser --force pour réécrire")
         return False
 
-    tmp = path.with_suffix(".tmp")
+    tmp = path.parent / (path.name + ".tmp")  # IP-41-FIX1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(content, encoding="utf-8")
@@ -610,36 +706,45 @@ def _create_directories() -> None:
         Path("output/charts"),
         Path("logs"),
         Path("prompts"),
+        Path("backups"),
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
         log.debug(f"DOSSIER {d} ✓")
-    log.info(f"DOSSIERS créés : {[str(d) for d in dirs]}")
+    log.info(f"DOSSIERS créés/vérifiés : {[str(d) for d in dirs]}")
 
 
 def _check_integrity() -> dict[str, list[str]]:
     """
-    Vérifie l'intégrité de tous les fichiers prompts.
-    Retourne un dict {fichier: [marqueurs_manquants]}.
+    Vérifie l'intégrité de tous les fichiers prompts et de la structure.
+    Retourne un dict {fichier: [problèmes]} — vide = tout OK.
+    IP-41-FIX2 : system.txt vérifié sur son contenu (TAVILYMAX).
     """
     issues: dict[str, list[str]] = {}
 
-    # Prompts
+    # System prompt
+    sys_issues = _validate_prompt(
+        Path("prompts/system.txt"), REQUIRED_SYSTEM_MARKERS, "system"
+    )
+    if sys_issues:
+        issues["prompts/system.txt"] = sys_issues
+
+    # Prompt journalier
     daily_issues = _validate_prompt(
         Path("prompts/daily.txt"), REQUIRED_DAILY_MARKERS, "daily"
     )
     if daily_issues:
         issues["prompts/daily.txt"] = daily_issues
 
+    # Prompt mensuel + 8 modules obligatoires (CDC-C3)
     monthly_issues = _validate_prompt(
         Path("prompts/monthly.txt"), REQUIRED_MONTHLY_MARKERS, "monthly"
     )
-    # Vérifier les 8 modules obligatoires (CDC-C3)
     if Path("prompts/monthly.txt").exists():
-        content = Path("prompts/monthly.txt").read_text(encoding="utf-8").upper()
+        content_upper = Path("prompts/monthly.txt").read_text(encoding="utf-8").upper()
         missing_modules = [
             m for m in REQUIRED_MONTHLY_MODULES
-            if m.upper() not in content
+            if m.upper() not in content_upper
         ]
         if missing_modules:
             monthly_issues.extend([f"MODULE MANQUANT: {m}" for m in missing_modules])
@@ -647,12 +752,12 @@ def _check_integrity() -> dict[str, list[str]]:
         issues["prompts/monthly.txt"] = monthly_issues
 
     # Fichiers critiques
-    for f in ["prompts/system.txt", "requirements.txt", "SCOPE.md", ".env.example"]:
+    for f in ["requirements.txt", "SCOPE.md", ".env.example", "CHANGELOG.md"]:
         if not Path(f).exists():
             issues[f] = ["FICHIER ABSENT"]
 
-    # Dossiers
-    for d in ["data", "output", "output/charts", "logs", "prompts"]:
+    # Dossiers obligatoires
+    for d in ["data", "output", "output/charts", "logs", "prompts", "backups"]:
         if not Path(d).is_dir():
             issues[d] = ["DOSSIER ABSENT"]
 
@@ -660,20 +765,100 @@ def _check_integrity() -> dict[str, list[str]]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# POINT D'ENTRÉE PRINCIPAL
+# POINT D'ENTRÉE PRINCIPAL (IP-41-FIX3 : main() complétée)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     """
     Initialise la structure complète du projet SENTINEL.
-    Retourne 0 (succès) ou 1 (erreur).
+    Retourne 0 (succès) ou 1 (erreur détectée).
     """
     log.info("─" * 60)
-    log.info("SENTINEL v3.40 — Initialisation des prompts & structure projet")
+    log.info("SENTINEL v3.42 — Initialisation des prompts & structure projet")
     if FORCE_REWRITE:
         log.info("MODE --force : tous les fichiers seront réécrits")
     if CHECK_ONLY:
         log.info("MODE --check : vérification sans réécriture")
     log.info("─" * 60)
 
-    # ── Mode check-only ───────────────────────────────────────────────────────\n    if CHECK_ONLY:\n        issues = _check_integrity()\n        if not issues:\n            log.info("✓ Intégrité OK — tous
+    # ── Mode check-only ───────────────────────────────────────────────────
+    if CHECK_ONLY:
+        issues = _check_integrity()
+        if not issues:
+            log.info("✓ Intégrité OK — tous les fichiers et dossiers sont en place")
+            return 0
+        else:
+            log.warning(f"✗ {len(issues)} problème(s) détecté(s) :")
+            for path, problems in issues.items():
+                for p in problems:
+                    log.warning(f"  [{path}] {p}")
+            return 1
+
+    # ── Création de la structure de dossiers ──────────────────────────────
+    _create_directories()
+
+    # ── Construction dynamique de SCOPE.md (IP-42-FIX1) ─────────────────
+    # Appelé ici pour capturer les versions des scripts au moment de l'init,
+    # pas au moment de l'import du module.
+    scope_md_content = _build_scope_md()
+
+    # ── Écriture des fichiers ─────────────────────────────────────────────
+    files_written = 0
+    files_skipped = 0
+
+    write_targets = [
+        (Path("prompts/system.txt"),  SYSTEM_PROMPT,    "system prompt"),
+        (Path("prompts/daily.txt"),   DAILY_PROMPT,     "prompt journalier"),
+        (Path("prompts/monthly.txt"), MONTHLY_PROMPT,   "prompt mensuel"),
+        (Path("requirements.txt"),    REQUIREMENTS_TXT, "requirements.txt"),
+        (Path(".env.example"),        ENV_EXAMPLE,      ".env.example"),
+        (Path("SCOPE.md"),            scope_md_content, "SCOPE.md"),  # IP-42-FIX1
+        (Path("CHANGELOG.md"),        CHANGELOG_MD,     "CHANGELOG.md"),
+    ]
+
+    for path, content, label in write_targets:
+        written = _write_file(path, content, label)
+        if written:
+            files_written += 1
+        else:
+            files_skipped += 1
+
+    # ── Validation post-écriture (NEW-IP3) ────────────────────────────────
+    log.info("─" * 60)
+    log.info("Validation des marqueurs après écriture...")
+
+    issues = _check_integrity()
+
+    if not issues:
+        log.info("✓ Tous les marqueurs validés — prompts cohérents avec sentinel_api.py")
+    else:
+        log.error(f"✗ {len(issues)} problème(s) de validation :")
+        for path, problems in issues.items():
+            for p in problems:
+                log.error(f"  [{path}] {p}")
+
+    # ── Résumé final ──────────────────────────────────────────────────────
+    log.info("─" * 60)
+    log.info(f"RÉSUMÉ : {files_written} fichier(s) écrit(s), {files_skipped} ignoré(s)")
+
+    if not Path(".env").exists():
+        log.warning(
+            "ATTENTION : fichier .env absent. "
+            "Copier .env.example → .env et remplir ANTHROPIC_API_KEY et SMTP_PASS."
+        )
+
+    if issues:
+        log.error("Initialisation terminée avec erreurs. Voir logs ci-dessus.")
+        return 1
+
+    log.info("✓ Initialisation SENTINEL v3.42 terminée avec succès.")
+    log.info("  Prochaine étape : python sentinel_main.py")
+    return 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENTRÉE
+# ═════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    sys.exit(main())
