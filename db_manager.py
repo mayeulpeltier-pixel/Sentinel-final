@@ -1,32 +1,48 @@
-# dbmanager.py --- SENTINEL v3.40 --- Gestionnaire SQLite WAL
+# db_manager.py --- SENTINEL v3.41 --- Gestionnaire SQLite WAL
 # =============================================================================
 # CORRECTIONS v3.40 :
-#   BUG-DB1  UNIQUE sur reports.date         → ON CONFLICT(date) fonctionnel
-#   BUG-DB2  datetime SQLite valide          → purge 90j opérationnelle
-#   BUG-DB3  DDL exécuté une seule fois      → _DB_INITIALIZED + verrou
-#   BUG-DB4  Table acteurs CRUD manquant     → saveacteur / getacteurs
-#   BUG-DB5  SQL dynamique savemetrics()     → whitelist _ALLOWED_METRIC_COLS
-#   BUG-DB6  LIMIT ≠ filtre temporel         → WHERE date >= date('now', ?)
-#   BUG-DB7  Wildcards LIKE non échappés     → ESCAPE '\\'
-#   BUG-DB8  rawtail jamais exposée          → getrecentreports() inclut rawtail
+# BUG-DB1  UNIQUE sur reports.date → ON CONFLICT(date) fonctionnel
+# BUG-DB2  datetime SQLite valide → purge 90j opérationnelle
+# BUG-DB3  DDL exécuté une seule fois → _DB_INITIALIZED + verrou
+# BUG-DB4  Table acteurs CRUD manquant → saveacteur / getacteurs
+# BUG-DB5  SQL dynamique savemetrics() → whitelist _ALLOWED_METRIC_COLS
+# BUG-DB6  LIMIT ≠ filtre temporel → WHERE date >= date('now', ?)
+# BUG-DB7  Wildcards LIKE non échappés → ESCAPE '\\'
+# BUG-DB8  rawtail jamais exposée → getrecentreports() inclut rawtail
 # AMÉLIORATIONS v3.40 :
-#   PERF-DB1 Connexions thread-locales       → _get_thread_conn / closedb()
-#   PERF-DB2 VACUUM + ANALYZE automatique    → maintenance() corrigé
-#   MAINT-DB1 Archivage JSON post-migration  → .json.migrated
-#   MAINT-DB2 PRAGMA cache_size / mmap       → 32 MB cache, 64 MB mmap
-#   MAINT-DB3 Index sur colonnes actives     → idx_tendances_active / alertes
-#   EXTRA-1   getmetrics() pour dashboard    → lecture métriques agrégées
-#   EXTRA-2   closedb() nettoyage thread     → appelé en fin de cron
+# PERF-DB1 Connexions thread-locales → _get_thread_conn / closedb()
+# PERF-DB2 VACUUM + ANALYZE automatique → maintenance() corrigé
+# MAINT-DB1 Archivage JSON post-migration → .json.migrated
+# MAINT-DB2 PRAGMA cache_size / mmap → 32 MB cache, 64 MB mmap
+# MAINT-DB3 Index sur colonnes actives → idx_tendances_active / alertes
+# EXTRA-1  getmetrics() pour dashboard → lecture métriques agrégées
+# EXTRA-2  closedb() nettoyage thread → appelé en fin de cron
+#
+# CORRECTIONS v3.41 :
+# DB41-FIX1 maintenance() : closedb() avant _create_connection() pour éviter
+#           deux connexions simultanées pendant VACUUM (conflict WAL)
+# DB41-FIX2 runmigration() : rename() → replace() (FileExistsError sur Windows
+#           si .json.migrated existe déjà)
+# DB41-FIX3 loadseen() : filtre temporel WHERE dateseen >= date('now', ?)
+#           évite de charger des centaines de milliers de hashes en RAM
+#           après plusieurs mois de production
+# DB41-FIX4 backup_db() : imports shutil/time déplacés en tête de fichier
+#           (étaient locaux à la fonction → re-importés à chaque appel)
+# DB41-FIX5 getdb() : exc_info=True ajouté sur log.error rollback
+#           → stack trace complète dans les logs
+# DB41-FIX6 ouvrirealerte() : INSERT OR IGNORE remplacé par un UPSERT
+#           sur (texte, active) pour éviter les doublons d'alertes actives
 # =============================================================================
 # Compatibilité pipeline v3.37 totalement préservée (API SentinelDB inchangée)
-# Auteur : Projet SENTINEL — Avril 2026
 # =============================================================================
 
 import json
 import logging
 import os
+import shutil      # DB41-FIX4 — était importé localement dans backup_db()
 import sqlite3
 import threading
+import time        # DB41-FIX4 — était importé localement dans backup_db()
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,48 +72,48 @@ _ALLOWED_METRIC_COLS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# DDL v3.40 — schéma complet 6 tables
+# DDL v3.41 — schéma complet 6 tables
 # ---------------------------------------------------------------------------
 _DDL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA cache_size    = -32000;
-PRAGMA mmap_size     = 67108864;
-PRAGMA synchronous   = NORMAL;
+PRAGMA cache_size = -32000;
+PRAGMA mmap_size = 67108864;
+PRAGMA synchronous = NORMAL;
 
 CREATE TABLE IF NOT EXISTS reports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    date        TEXT    NOT NULL UNIQUE,
-    indice      REAL    DEFAULT 5.0,
-    alerte      TEXT    DEFAULT 'VERT',
-    compressed  TEXT,
-    rawtail     TEXT
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    date     TEXT NOT NULL UNIQUE,
+    indice   REAL DEFAULT 5.0,
+    alerte   TEXT DEFAULT 'VERT',
+    compressed TEXT,
+    rawtail  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tendances (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    texte        TEXT    NOT NULL UNIQUE,
-    datepremiere TEXT    NOT NULL,
-    datederniere TEXT    NOT NULL,
+    texte        TEXT NOT NULL UNIQUE,
+    datepremiere TEXT NOT NULL,
+    datederniere TEXT NOT NULL,
     count        INTEGER DEFAULT 1,
     active       INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS alertes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    texte         TEXT    NOT NULL,
-    dateouverture TEXT    NOT NULL,
+    texte         TEXT NOT NULL,
+    dateouverture TEXT NOT NULL,
     datecloture   TEXT,
     active        INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS acteurs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    nom              TEXT    NOT NULL UNIQUE,
+    nom              TEXT NOT NULL UNIQUE,
     pays             TEXT,
-    scoreactivite    REAL    DEFAULT 0.0,
+    scoreactivite    REAL DEFAULT 0.0,
     derniereactivite TEXT,
-    dateajout        TEXT    NOT NULL
+    dateajout        TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS seenhashes (
@@ -108,7 +124,7 @@ CREATE TABLE IF NOT EXISTS seenhashes (
 
 CREATE TABLE IF NOT EXISTS metrics (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    date          TEXT    NOT NULL UNIQUE,
+    date          TEXT NOT NULL UNIQUE,
     indice        REAL,
     alerte        TEXT,
     nb_articles   INTEGER,
@@ -139,6 +155,7 @@ CREATE INDEX IF NOT EXISTS idx_acteurs_score
 # ---------------------------------------------------------------------------
 # CONNEXION INTERNE
 # ---------------------------------------------------------------------------
+
 def _create_connection() -> sqlite3.Connection:
     global _DB_INITIALIZED
     DBPATH.parent.mkdir(parents=True, exist_ok=True)
@@ -148,8 +165,8 @@ def _create_connection() -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA cache_size  = -32000")
-    conn.execute("PRAGMA mmap_size   = 67108864")
+    conn.execute("PRAGMA cache_size = -32000")
+    conn.execute("PRAGMA mmap_size = 67108864")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     if not _DB_INITIALIZED:
@@ -158,7 +175,7 @@ def _create_connection() -> sqlite3.Connection:
                 conn.executescript(_DDL)
                 conn.commit()
                 _DB_INITIALIZED = True
-                log.info("DB schéma initialisé (v3.40)")
+                log.info("DB schéma initialisé (v3.41)")
     return conn
 
 
@@ -194,17 +211,17 @@ def getdb():
             conn.rollback()
         except Exception:
             pass
-        log.error(f"DB rollback : {exc}")
+        log.error(f"DB rollback : {exc}", exc_info=True)  # DB41-FIX5
         raise
-
 
 # ---------------------------------------------------------------------------
 # CLASSE PRINCIPALE — API publique compatible v3.37
 # ---------------------------------------------------------------------------
+
 class SentinelDB:
 
     # ------------------------------------------------------------------ #
-    #  REPORTS                                                             #
+    # REPORTS                                                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -242,7 +259,7 @@ class SentinelDB:
 
     @staticmethod
     def tolegacydict() -> dict:
-        """Rétrocompatibilité memorymanager.py (DEPRECATED — utiliser SentinelDB)."""
+        """Rétrocompatibilité memory_manager.py (DEPRECATED — utiliser SentinelDB)."""
         reports = SentinelDB.getrecentreports(ndays=90)
         return {
             "compressed_reports": [
@@ -260,13 +277,21 @@ class SentinelDB:
         }
 
     # ------------------------------------------------------------------ #
-    #  SEENHASHES                                                          #
+    # SEENHASHES                                                           #
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def loadseen() -> set:
+    def loadseen(days: int = 90) -> set:
+        """
+        DB41-FIX3 — Charge uniquement les hashes des N derniers jours.
+        Évite de charger toute la table en RAM après plusieurs mois de production.
+        Paramètre days synchronisé avec purgeseeolderthandays() (défaut 90j).
+        """
         with getdb() as db:
-            rows = db.execute("SELECT hash FROM seenhashes").fetchall()
+            rows = db.execute(
+                "SELECT hash FROM seenhashes WHERE dateseen >= datetime('now', ?)",
+                (f"-{days} days",),
+            ).fetchall()
         return {r["hash"] for r in rows}
 
     @staticmethod
@@ -287,17 +312,17 @@ class SentinelDB:
                 "DELETE FROM seenhashes WHERE dateseen < datetime('now', ?)",
                 (f"-{days} days",),
             )
-            deleted = cur.rowcount
+        deleted = cur.rowcount
         log.info(f"PURGE seenhashes : {deleted} entrée(s) supprimée(s) (>{days}j)")
         return deleted
 
     # ------------------------------------------------------------------ #
-    #  TENDANCES                                                           #
+    # TENDANCES                                                            #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def savetendance(texte: str, date: str) -> None:
-        texte = (texte or "")[:500]  # P4-FIX: tronque les entrées anormalement longues
+        texte = (texte or "")[:500]  # P4-FIX : tronque les entrées anormalement longues
         if not texte.strip():
             return
         with getdb() as db:
@@ -329,19 +354,31 @@ class SentinelDB:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
-    #  ALERTES                                                             #
+    # ALERTES                                                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def ouvrirealerte(texte: str, date: str) -> None:
+        """
+        DB41-FIX6 — Remplace INSERT OR IGNORE par un vrai UPSERT sur texte.
+        La table alertes n'a pas de UNIQUE sur texte, donc INSERT OR IGNORE
+        n'avait aucun effet protecteur → chaque appel créait un doublon.
+        Solution : vérifier l'existence d'une alerte active identique avant insert.
+        """
         texte = (texte or "")[:500]  # P4-FIX
         if not texte.strip():
             return
         with getdb() as db:
-            db.execute(
-                "INSERT OR IGNORE INTO alertes(texte, dateouverture, active) VALUES(?,?,1)",
-                (texte, date),
-            )
+            # Vérifie si une alerte active identique existe déjà
+            existing = db.execute(
+                "SELECT id FROM alertes WHERE texte = ? AND active = 1",
+                (texte,),
+            ).fetchone()
+            if existing is None:
+                db.execute(
+                    "INSERT INTO alertes(texte, dateouverture, active) VALUES(?,?,1)",
+                    (texte, date),
+                )
 
     @staticmethod
     def closealerte(texte: str, date: str) -> None:
@@ -352,7 +389,7 @@ class SentinelDB:
                 UPDATE alertes
                 SET active = 0, datecloture = ?
                 WHERE active = 1
-                  AND texte LIKE ? ESCAPE '\\'
+                AND texte LIKE ? ESCAPE '\\'
                 """,
                 (date, f"%{escaped}%"),
             )
@@ -371,7 +408,7 @@ class SentinelDB:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
-    #  ACTEURS — BUG-DB4 FIX                                              #
+    # ACTEURS — BUG-DB4 FIX                                               #
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -408,12 +445,12 @@ class SentinelDB:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
-    #  METRICS                                                             #
+    # METRICS                                                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def savemetrics(date: str, **kwargs) -> None:
-        safe = {k: v for k, v in kwargs.items() if k in _ALLOWED_METRIC_COLS}
+        safe    = {k: v for k, v in kwargs.items() if k in _ALLOWED_METRIC_COLS}
         unknown = set(kwargs) - _ALLOWED_METRIC_COLS
         if unknown:
             log.warning(f"METRICS colonnes inconnues ignorées : {unknown}")
@@ -446,42 +483,57 @@ class SentinelDB:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
-    #  MAINTENANCE — PERF-DB2 FIX                                         #
+    # MAINTENANCE — PERF-DB2 FIX + DB41-FIX1                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def maintenance(force: bool = False) -> None:
-        """VACUUM + ANALYZE mensuels. Appeler le 1er du mois dans sentinelmain.py."""
+        """
+        VACUUM + ANALYZE mensuels. Appeler le 1er du mois dans sentinel_main.py.
+
+        DB41-FIX1 — closedb() appelé AVANT _create_connection() pour éviter
+        deux connexions simultanées sur le même fichier pendant VACUUM.
+        VACUUM requiert autocommit exclusif : une transaction ouverte dans
+        la connexion thread-locale provoquerait un conflit WAL.
+        """
+        # Fermer proprement la connexion thread-locale avant d'ouvrir une
+        # connexion dédiée au VACUUM (qui requiert autocommit exclusif)
+        closedb()  # DB41-FIX1
+
         conn = _create_connection()
         try:
             version   = conn.execute("PRAGMA user_version").fetchone()[0]
             now_month = int(datetime.now().strftime("%Y%m"))
             if not force and version >= now_month:
-                conn.close()
                 return
+
             log.info("MAINTENANCE : WAL checkpoint + VACUUM + ANALYZE...")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
-            old_isolation        = conn.isolation_level
-            conn.isolation_level = None      # VACUUM requiert autocommit
+
+            old_isolation      = conn.isolation_level
+            conn.isolation_level = None   # VACUUM requiert autocommit
             conn.execute("VACUUM")
             conn.isolation_level = old_isolation
+
             conn.execute("ANALYZE")
             conn.execute(f"PRAGMA user_version = {now_month}")
             conn.commit()
             log.info(f"MAINTENANCE terminée (user_version={now_month})")
+
         except Exception as exc:
-            log.error(f"MAINTENANCE erreur : {exc}")
+            log.error(f"MAINTENANCE erreur : {exc}", exc_info=True)
             try:
                 conn.rollback()
             except Exception:
                 pass
         finally:
             conn.close()
-
+            # Ne pas remettre dans thread_local : laisser se recréer proprement
+            # au prochain accès via _get_thread_conn()
 
     # ------------------------------------------------------------------ #
-    #  ALIASES snake_case — compatibilité multi-scripts (BUG-3 à BUG-6)  #
+    # ALIASES snake_case — compatibilité multi-scripts (BUG-3 à BUG-6)   #
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -504,28 +556,29 @@ class SentinelDB:
         """Alias de purgeseeolderthandays() — scraper_rss.py (BUG-6)."""
         return SentinelDB.purgeseeolderthandays(days)
 
-
 # ---------------------------------------------------------------------------
 # HEALTHCHECK
 # ---------------------------------------------------------------------------
+
 def check_integrity() -> bool:
     try:
         with getdb() as db:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             wal       = db.execute("PRAGMA journal_mode").fetchone()[0]
-        ok = (integrity == "ok" and wal == "wal")
-        log.info(f"HEALTHCHECK DB : {'OK' if ok else 'FAIL'} (integrity={integrity}, wal={wal})")
-        return ok
+            ok        = (integrity == "ok" and wal == "wal")
+            log.info(f"HEALTHCHECK DB : {'OK' if ok else 'FAIL'} "
+                     f"(integrity={integrity}, wal={wal})")
+            return ok
     except Exception as exc:
-        log.error(f"HEALTHCHECK DB exception : {exc}")
+        log.error(f"HEALTHCHECK DB exception : {exc}", exc_info=True)
         return False
-
 
 # ---------------------------------------------------------------------------
 # INIT & MIGRATION
 # ---------------------------------------------------------------------------
+
 def initdb() -> None:
-    """Point d'entrée appelé par sentinelmain.py au démarrage."""
+    """Point d'entrée appelé par sentinel_main.py au démarrage."""
     DBPATH.parent.mkdir(parents=True, exist_ok=True)
     with getdb():
         pass
@@ -537,6 +590,9 @@ def runmigration() -> None:
     """
     Migre JSON → SQLite (v3.37 → v3.40).
     Les fichiers JSON sont archivés en .json.migrated après migration.
+
+    DB41-FIX2 — rename() → replace() : évite FileExistsError sur Windows
+    si le fichier .json.migrated existe déjà (re-migration accidentelle).
     """
     log.info("MIGRATION JSON → SQLite démarrage...")
 
@@ -550,7 +606,7 @@ def runmigration() -> None:
                     "INSERT OR IGNORE INTO seenhashes(hash, dateseen) VALUES(?,?)",
                     [(h, today) for h in hashes],
                 )
-            SEENJSON.rename(SEENJSON.with_suffix(".json.migrated"))
+            SEENJSON.replace(SEENJSON.with_suffix(".json.migrated"))  # DB41-FIX2
             log.info(f"MIGRATION seenhashes : {len(hashes)} hash(es) migrés")
         except Exception as exc:
             log.error(f"MIGRATION seenhashes échec : {exc}")
@@ -578,75 +634,19 @@ def runmigration() -> None:
                     score = float(data.get("scoreactivite", 0.0)),
                     date  = today,
                 )
-            MEMJSON.rename(MEMJSON.with_suffix(".json.migrated"))
+            MEMJSON.replace(MEMJSON.with_suffix(".json.migrated"))  # DB41-FIX2
             log.info("MIGRATION mémoire terminée")
         except Exception as exc:
             log.error(f"MIGRATION mémoire échec : {exc}")
 
-    MIGRATION_FLAG.write_text("v3.40", encoding="utf-8")
+    MIGRATION_FLAG.write_text("v3.41", encoding="utf-8")
     log.info("MIGRATION terminée — flag écrit")
     closedb()
 
-
 # ---------------------------------------------------------------------------
-# SMOKE TESTS
+# BACKUP AUTOMATIQUE SQLite (F2/G3)
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import tempfile
-    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        os.environ["SENTINEL_DB"] = f"{tmpdir}/test.db"
-        _DB_INITIALIZED = False
-        DBPATH = Path(f"{tmpdir}/test.db")
-
-        initdb()
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        # BUG-DB1 : double insert même date → UPSERT
-        SentinelDB.savereport(today, 7.2, "ORANGE", "Rapport test", "...brut")
-        SentinelDB.savereport(today, 8.0, "ROUGE",  "Rapport MAJ",  "...brut MAJ")
-        reports = SentinelDB.getrecentreports(ndays=7)
-        assert len(reports) == 1,                       "BUG-DB1 : plus d'1 rapport"
-        assert reports[0]["alerte"] == "ROUGE",         "BUG-DB1 : upsert échoué"
-        assert reports[0]["rawtail"] == "...brut MAJ",  "BUG-DB8 : rawtail incorrecte"
-
-        # BUG-DB2 : purge syntaxe valide
-        SentinelDB.saveseen({"h1", "h2"}, source="Test")
-        assert isinstance(SentinelDB.purgeseeolderthandays(90), int), "BUG-DB2 KO"
-
-        # BUG-DB4 : acteurs CRUD
-        SentinelDB.saveacteur("Milrem Robotics", "EST", 8.5, today)
-        SentinelDB.saveacteur("Milrem Robotics", None, 9.0, today)
-        acteurs = SentinelDB.getacteurs()
-        assert acteurs[0]["scoreactivite"] == 9.0, "BUG-DB4 : update score KO"
-        assert acteurs[0]["pays"] == "EST",         "BUG-DB4 : COALESCE pays KO"
-
-        # BUG-DB5 : whitelist metrics
-        SentinelDB.savemetrics(today, indice=7.2, alerte="ORANGE", colonneInvalide=99)
-        metrics = SentinelDB.getmetrics(ndays=7)
-        assert len(metrics) == 1, "EXTRA-1 : getmetrics KO"
-
-        # BUG-DB7 : wildcards échappés
-        SentinelDB.ouvrirealerte("Déploiement KARGU 100% confirmé", today)
-        SentinelDB.ouvrirealerte("Type_X Korea opérationnel", today)
-        SentinelDB.closealerte("KARGU 100%", today)
-        alertes = SentinelDB.getalertesactives()
-        assert len(alertes) == 1,       "BUG-DB7 : mauvais nb d'alertes fermées"
-        assert "Type_X" in alertes[0]["texte"], "BUG-DB7 : mauvaise alerte fermée"
-
-        # PERF-DB1 : closedb thread-local\n        closedb()\n        assert getattr(_thread_local, "conn", None) is None, "PERF-DB1 : leak connexion"\n\n        assert check_integrity(), "HEALTHCHECK FAIL"\n\n        print("\n" + "=" * 55)
-        print("✅  Tous les smoke tests v3.40 passent.")
-        print(f"   Rapports        : {len(reports)}")
-        print(f"   Acteurs         : {len(acteurs)}")
-        print(f"   Métriques       : {len(metrics)}")
-        print(f"   Alertes actives : {len(alertes)}")
-        print("=" * 55)
-
-
-# =============================================================================
-# BACKUP AUTOMATIQUE SQLite (F2/G3 — recommandation audit)
-# =============================================================================
+# DB41-FIX4 : shutil et time importés en tête de fichier (n'étaient pas ici)
 
 def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
     """
@@ -654,13 +654,9 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
     F2-FIX : protège contre la perte totale de l'historique sur corruption disque.
     Garde les N derniers jours de backup (purge automatique).
 
-    Usage cron : 0 7 * * * python -c "from db_manager import backup_db; backup_db()"
+    Usage cron  : 0 7 * * * python -c "from db_manager import backup_db; backup_db()"
     Usage cloud : après backup_db(), utiliser rclone copy backups/ remote:bucket
     """
-    import shutil
-    import time
-    from datetime import datetime
-
     try:
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
@@ -669,7 +665,7 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
             log.warning("BACKUP sentinel.db absent — rien à sauvegarder")
             return False
 
-        date_str   = datetime.now().strftime("%Y%m%d")
+        date_str    = datetime.now().strftime("%Y%m%d")
         backup_path = dest / f"sentinel_{date_str}.db"
 
         # WAL checkpoint avant backup pour garantir la cohérence
@@ -681,7 +677,7 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
         log.info(f"BACKUP OK → {backup_path} ({size_kb} Ko)")
 
         # Purge des backups > keep_days jours
-        cutoff = time.time() - keep_days * 86400
+        cutoff  = time.time() - keep_days * 86400
         removed = 0
         for f in dest.glob("sentinel_*.db"):
             if f.stat().st_mtime < cutoff:
@@ -693,13 +689,86 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
         return True
 
     except Exception as exc:
-        log.error(f"BACKUP échec : {exc}")
+        log.error(f"BACKUP échec : {exc}", exc_info=True)
         return False
 
+# ---------------------------------------------------------------------------
+# SMOKE TESTS
+# ---------------------------------------------------------------------------
 
-# =============================================================================
-# ALIASES v3.40-fix — compatibilité snake_case (BUG-1 à BUG-9)
-# =============================================================================
-get_db = getdb          # scraper_rss, nlp_scorer, ops_patents, telegram_scraper
-init_db = initdb        # health_check
-run_migration = runmigration  # health_check
+if __name__ == "__main__":
+    import tempfile
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.environ["SENTINEL_DB"] = f"{tmpdir}/test.db"
+        _DB_INITIALIZED = False
+        DBPATH          = Path(f"{tmpdir}/test.db")
+
+        initdb()
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # BUG-DB1 : double insert même date → UPSERT
+        SentinelDB.savereport(today, 7.2, "ORANGE", "Rapport test",   "...brut")
+        SentinelDB.savereport(today, 8.0, "ROUGE",  "Rapport MAJ",    "...brut MAJ")
+        reports = SentinelDB.getrecentreports(ndays=7)
+        assert len(reports) == 1,                    "BUG-DB1 : plus d'1 rapport"
+        assert reports[0]["alerte"] == "ROUGE",      "BUG-DB1 : upsert échoué"
+        assert reports[0]["rawtail"] == "...brut MAJ", "BUG-DB8 : rawtail incorrecte"
+
+        # BUG-DB2 : purge syntaxe valide
+        SentinelDB.saveseen({"h1", "h2"}, source="Test")
+        assert isinstance(SentinelDB.purgeseeolderthandays(90), int), "BUG-DB2 KO"
+
+        # DB41-FIX3 : loadseen avec filtre temporel
+        seen = SentinelDB.loadseen(days=90)
+        assert "h1" in seen, "DB41-FIX3 : loadseen filtre KO"
+
+        # BUG-DB4 : acteurs CRUD
+        SentinelDB.saveacteur("Milrem Robotics", "EST", 8.5, today)
+        SentinelDB.saveacteur("Milrem Robotics", None,  9.0, today)
+        acteurs = SentinelDB.getacteurs()
+        assert acteurs[0]["scoreactivite"] == 9.0, "BUG-DB4 : update score KO"
+        assert acteurs[0]["pays"] == "EST",        "BUG-DB4 : COALESCE pays KO"
+
+        # BUG-DB5 : whitelist metrics
+        SentinelDB.savemetrics(today, indice=7.2, alerte="ORANGE", colonneInvalide=99)
+        metrics = SentinelDB.getmetrics(ndays=7)
+        assert len(metrics) == 1, "EXTRA-1 : getmetrics KO"
+
+        # BUG-DB7 : wildcards échappés
+        SentinelDB.ouvrirealerte("Déploiement KARGU 100% confirmé", today)
+        SentinelDB.ouvrirealerte("Type_X Korea opérationnel",        today)
+        SentinelDB.closealerte("KARGU 100%", today)
+        alertes = SentinelDB.getalertesactives()
+        assert len(alertes) == 1,               "BUG-DB7 : mauvais nb d'alertes fermées"
+        assert "Type_X" in alertes[0]["texte"], "BUG-DB7 : mauvaise alerte fermée"
+
+        # DB41-FIX6 : pas de doublon sur ouvrirealerte()
+        SentinelDB.ouvrirealerte("Type_X Korea opérationnel", today)
+        SentinelDB.ouvrirealerte("Type_X Korea opérationnel", today)
+        alertes2 = SentinelDB.getalertesactives()
+        assert len(alertes2) == 1, "DB41-FIX6 : doublon alerte détecté"
+
+        # PERF-DB1 : closedb thread-local
+        closedb()
+        assert getattr(_thread_local, "conn", None) is None, "PERF-DB1 : leak connexion"
+
+        assert check_integrity(), "HEALTHCHECK FAIL"
+
+        print("
+" + "=" * 55)
+        print("✅ Tous les smoke tests v3.41 passent.")
+        print(f"   Rapports       : {len(reports)}")
+        print(f"   Acteurs        : {len(acteurs)}")
+        print(f"   Métriques      : {len(metrics)}")
+        print(f"   Alertes actives: {len(alertes2)}")
+        print(f"   Seenhashes     : {len(seen)}")
+        print("=" * 55)
+
+# ---------------------------------------------------------------------------
+# ALIASES module-level — compatibilité snake_case (BUG-1 à BUG-9)
+# ---------------------------------------------------------------------------
+get_db         = getdb          # scraper_rss, nlp_scorer, ops_patents, telegram_scraper
+init_db        = initdb         # health_check
+run_migration  = runmigration   # health_check
