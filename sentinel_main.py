@@ -1,77 +1,47 @@
 #!/usr/bin/env python3
-# sentinel_main.py --- SENTINEL v3.50 --- ORCHESTRATEUR PRINCIPAL
+# sentinel_main.py --- SENTINEL v3.54 --- ORCHESTRATEUR PRINCIPAL
 # =============================================================================
-# v3.41 — Corrections post-audit :
-#   MAIN-41-FIX1  SONNET_MODEL transmis à run_sentinel()
-#   MAIN-41-FIX2  articles.extend(tg_arts or []) — guard None
-#   MAIN-41-FIX3  Port SENTINEL_HEALTH_PORT : try/except ValueError
-#   MAIN-41-FIX4  _load_optional_scraper() : guard spec/loader None
-#   MAIN-41-FIX5  run_monthly_report() non vide — warning + stub documenté
-#   MAIN-41-FIX6  Wrapper log() supprimé — logger.info/warning/error directs
-#   MAIN-41-FIX7  Crash pipeline : tentative notification email (non bloquant)
-#   MAIN-41-FIX8  REPORT_RETENTION_DAYS depuis ENV (n'était pas configurable)
+# [historique v3.41 → v3.51 conservé dans le dépôt Git — omis ici pour lisibilité]
 #
-# v3.42 — Intégration procurement :
-#   MAIN-42-FIX1  run_all_procurement() intégré dans main()
+# v3.52 — Corrections post-audit externe :
+#   MAIN-52-FIX1  Guard + log WARNING si github_days_back rejeté par DB
+#   MAIN-52-FIX2  deltas = extract_memory_delta(...) or {} — guard None
+#   MAIN-52-FIX3  _should_run_github() → (bool, int, str|None) — une seule lecture
+#   MAIN-52-FIX4  Guard "if not filled" avant REDUCE
+#   MAIN-52-FIX5  MAX_CONTRACTS — cap contrats avant extension articles
+#   MAIN-52-FIX6  chr(10) → "
+" dans les f-strings
+#   MAIN-52-FIX7  Lock threading sur _ensure_health_server()
 #
-# v3.43 — Observabilité & rapport mensuel :
-#   MAIN-43-FIX1  _timed() — helper de timing par module
-#   MAIN-43-FIX2  run_monthly_report() — implémentation MapReduce
+# v3.53 — Corrections post-audit v3.52 :
+#   MAIN-53-FIX1  REGRESSION-1 : SyntaxError Python 3.10/3.11 — backslash
+#                 interdit dans expression f-string {…}. Variable intermédiaire
+#                 fallback_text extraite avant la f-string.
+#   MAIN-53-FIX2  logger.debug → logger.warning pour MAIN-52-FIX1 (visible INFO)
 #
-# v3.44 — Performance & robustesse :
-#   MAIN-44-FIX1  Parallélisation MAP via ThreadPoolExecutor(max_workers=8)
-#   MAIN-44-FIX2  _check_dependencies() au démarrage de main() et mensuel
+# v3.54 — Finitions post-audit final :
+#   MAIN-54-FIX1  from __future__ import annotations — type hints Python 3.10 propres
+#   MAIN-54-FIX2  date_obj_monthly extrait en tête de run_monthly_report()
+#                 (était recalculé inline dans build_html_report — double appel)
+#   MAIN-54-FIX3  _maybe_export_csv() : guard hasattr(SentinelDB, "export_csv")
+#                 avant l'appel — évite AttributeError si la méthode est absente
+#                 de db_manager.py (méthode optionnelle non listée dans _check_dependencies)
+#   MAIN-54-FIX4  _OPTIONAL_MODULES vérifiés une seule fois via _check_optional_modules()
+#                 appelé uniquement dans main() et non à chaque _check_dependencies()
+#                 (évite les logs redondants sur le rapport mensuel)
 #
-# v3.46 — Déclenchement GitHub & enrichissement prompt vendredi :
-#   MAIN-46-A     _should_run_github() remplace weekday() == 4
-#   MAIN-46-C     report_type "friday_rd" transmis à run_sentinel()
-#
-# v3.47 — Rattrapage GitHub robuste :
-#   MAIN-47-A     _should_run_github() → (bool, int) — days_back adaptatif
-#   MAIN-47-B     catchup_note injectée en tête de formatted_data
-#
-# v3.48 — Structuration Claude & persistance métriques GitHub :
-#   MAIN-48-A     catchup_note wrappée dans <system_notice>
-#   MAIN-48-B     github_days_back persisté dans SentinelDB.metrics
-#   MAIN-48-C     Annotation [RATTRAPAGE GITHUB Xj] dans les blocs REDUCE
-#
-# v3.49 — Contrainte de biais persistante dans le rapport mensuel :
-#   MAIN-49-A     <context_metadata> injectée en tête d'injection Sonnet
-#                 si au moins une semaine de rattrapage détectée.
-#                 Conditionnel, granularité par semaine, 4 consignes explicites.
-#                 catchup_weeks persisté dans compressed pour audit.
-#
-# v3.50 — Densité normalisée dans les annotations de biais :
-#   MAIN-50-A     Calcul déterministe de la densité articles/jour depuis DB.
-#
-#                 Idée source : "Trend-Normalizer" — donner à Sonnet un ratio
-#                 densité pour qu'il confirme l'absence de pic d'activité réel.
-#
-#                 Pourquoi PAS dans Haiku (phase MAP) :
-#                   1. Haiku n'a pas accès à github_days_back (dans metrics,
-#                      pas dans rawtail). Injection manuelle requise → complexité.
-#                   2. Compter des articles dans de la prose est non déterministe.
-#                      nb_articles est déjà persisté exactement dans SentinelDB.
-#                   3. Violation de responsabilité unique : Haiku MAP = compression,
-#                      pas métrologie.
-#
-#                 Implémentation correcte : division directe depuis DB.
-#                   articles_by_date chargé en même temps que metrics_by_date
-#                   (un seul getmetrics() pour les deux — zéro appel API supp.)
-#                   density = total_articles / effective_window (déterministe)
-#                   effective_window = max_gdb si rattrapage, sinon COOLDOWN
-#
-#                 Intégration :
-#                   catchup_weeks : list[tuple[int, int, float]]
-#                   Élargi de (semaine, gdb) → (semaine, gdb, density)
-#                   Annotation locale MAIN-48-C : densité inline
-#                   <context_metadata> MAIN-49-A : densité par semaine
-#                   compressed mensuel : density persistée pour audit futur
+# Corrections NON appliquées dans ce fichier (à corriger dans les modules concernés) :
+#   BUG-DB-1   : github_days_back absent du DDL et _ALLOWED_METRIC_COLS → db_manager.py
+#   BUG-MAIL-1 : regex d et s non échappés → mailer.py
+#   BUG-HC-1   : datetime.now() naïf → health_check.py
 # =============================================================================
+
+from __future__ import annotations  # MAIN-54-FIX1
 
 import datetime
 import json
 import logging
+import threading
 import time as timeperf
 import importlib.util as ilu
 import os
@@ -85,54 +55,64 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # CONFIGURATION & VERSION
 # ---------------------------------------------------------------------------
-VERSION      = "3.50"
+VERSION      = "3.54"
 SONNET_MODEL = os.environ.get("SENTINEL_MODEL", "claude-sonnet-4-6")
 
-REPORT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RETENTION_DAYS", "30"))
-GITHUB_COOLDOWN_DAYS  = int(os.environ.get("GITHUB_COOLDOWN_DAYS", "7"))
-GITHUB_MAX_LOOKBACK   = int(os.environ.get("GITHUB_MAX_LOOKBACK", "21"))
-DAYS_BACK_CFG         = int(os.environ.get("GITHUB_DAYS_BACK", "7"))
+REPORT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RETENTION_DAYS",  "30"))
+GITHUB_COOLDOWN_DAYS  = int(os.environ.get("GITHUB_COOLDOWN_DAYS",     "7"))
+GITHUB_MAX_LOOKBACK   = int(os.environ.get("GITHUB_MAX_LOOKBACK",      "21"))
+DAYS_BACK_CFG         = int(os.environ.get("GITHUB_DAYS_BACK",         "7"))
+MAX_CONTRACTS         = int(os.environ.get("SENTINEL_MAX_CONTRACTS",   "50"))
 _GITHUB_LAST_RUN_PATH = Path("data/github_last_run.txt")
 
-for d in ["logs", "data", "output", "backups"]:
-    Path(d).mkdir(exist_ok=True)
+for _d in ["logs", "data", "output", "backups"]:
+    Path(_d).mkdir(exist_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # LOGGING INDUSTRIEL
 # ---------------------------------------------------------------------------
-def init_logging():
+def init_logging() -> None:
     """Configure le logger structuré JSON. Ne fait QUE ça."""
     logging.basicConfig(
         level=logging.INFO,
-        format='{"ts":"%(asctime)s","lvl":"%(levelname)s","v":"' + VERSION + '","msg":"%(message)s"}',
+        format=(
+            '{"ts":"%(asctime)s","lvl":"%(levelname)s",'
+            f'"v":"{VERSION}","msg":"%(message)s"}}'
+        ),
         datefmt="%Y-%m-%dT%H:%M:%S",
         handlers=[
             logging.FileHandler("logs/sentinel.log", encoding="utf-8"),
-            logging.StreamHandler()
-        ]
+            logging.StreamHandler(),
+        ],
     )
+
 
 init_logging()
 logger = logging.getLogger("SENTINEL")
 
+
 # ---------------------------------------------------------------------------
-# DÉCLENCHEMENT GITHUB — MAIN-46-A → MAIN-47-A
+# DÉCLENCHEMENT GITHUB — MAIN-46-A → MAIN-47-A → MAIN-52-FIX3
 # ---------------------------------------------------------------------------
-def _should_run_github() -> tuple[bool, int]:
+def _should_run_github() -> tuple[bool, int, str | None]:
     """
-    [MAIN-47-A] Retourne (should_run: bool, effective_days_back: int).
+    Retourne (should_run, effective_days_back, last_run_iso).
+
+    [MAIN-52-FIX3] Lecture unique du fichier — élimine la double lecture
+    et la race condition théorique du pipeline v3.51.
+
     Logique :
-        1. Lit data/github_last_run.txt (date ISO YYYY-MM-DD)
-        2. Si delta >= GITHUB_COOLDOWN_DAYS :
-               effective_days = min(delta, GITHUB_MAX_LOOKBACK)
-        3. Si fichier absent → True + DAYS_BACK_CFG
-        4. Si illisible → fallback weekday() == 4 + DAYS_BACK_CFG
+        1. Lit data/github_last_run.txt une seule fois
+        2. Si delta >= GITHUB_COOLDOWN_DAYS → effective_days = min(delta, MAX_LOOKBACK)
+        3. Si fichier absent   → True, DAYS_BACK_CFG, None
+        4. Si illisible        → fallback weekday()==4, DAYS_BACK_CFG, None
     """
     today = datetime.date.today()
     try:
         if not _GITHUB_LAST_RUN_PATH.exists():
             logger.info("GITHUB _should_run: premier lancement → True")
-            return True, DAYS_BACK_CFG
+            return True, DAYS_BACK_CFG, None
 
         raw        = _GITHUB_LAST_RUN_PATH.read_text(encoding="utf-8").strip()
         last_run   = datetime.date.fromisoformat(raw)
@@ -146,23 +126,23 @@ def _should_run_github() -> tuple[bool, int]:
                 f"({'rattrapage' if delta_days > GITHUB_COOLDOWN_DAYS else 'cycle normal'}, "
                 f"cap={GITHUB_MAX_LOOKBACK}j)"
             )
-            return True, effective_days
+            return True, effective_days, raw
 
         logger.info(
             f"GITHUB _should_run: cooldown actif "
             f"(delta={delta_days}j < {GITHUB_COOLDOWN_DAYS}j) → False"
         )
-        return False, DAYS_BACK_CFG
+        return False, DAYS_BACK_CFG, raw
 
     except (ValueError, OSError) as e:
         logger.warning(
             f"GITHUB _should_run: lecture impossible ({e}) — fallback weekday()==4"
         )
-        return today.weekday() == 4, DAYS_BACK_CFG
+        return today.weekday() == 4, DAYS_BACK_CFG, None
 
 
 def _mark_github_ran() -> None:
-    """[MAIN-46-A] Écriture atomique .tmp → replace. Après scrape réussi."""
+    """Écriture atomique .tmp → replace. Appelé après scrape réussi."""
     today = datetime.date.today().isoformat()
     tmp   = _GITHUB_LAST_RUN_PATH.with_suffix(".tmp")
     try:
@@ -176,7 +156,7 @@ def _mark_github_ran() -> None:
 # ---------------------------------------------------------------------------
 # VALIDATION DES DÉPENDANCES — MAIN-44-FIX2
 # ---------------------------------------------------------------------------
-_REQUIRED_DAILY = [
+_REQUIRED_DAILY: list[tuple[str, str]] = [
     ("scraper_rss",    "scrape_all_feeds"),
     ("scraper_rss",    "format_for_claude"),
     ("memory_manager", "get_compressed_memory"),
@@ -192,13 +172,26 @@ _REQUIRED_DAILY = [
     ("samgov_scraper", "run_all_procurement"),
 ]
 
-_REQUIRED_MONTHLY = [
+_REQUIRED_MONTHLY: list[tuple[str, str]] = [
     ("memory_manager", "compress_text_haiku"),
     ("sentinel_api",   "run_sentinel_monthly"),
 ]
 
-def _check_dependencies(extra: list[tuple[str, str]] | None = None) -> list[str]:
-    """Vérifie importabilité + présence des attributs. Liste vide = OK."""
+# Modules optionnels — absence loggée en WARNING, pipeline non bloqué
+# [MAIN-54-FIX4] Vérifiés une seule fois via _check_optional_modules()
+_OPTIONAL_MODULES: list[tuple[str, str]] = [
+    ("nlp_scorer", "run_nlp_pipeline"),
+]
+
+
+def _check_dependencies(
+    extra: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """
+    Vérifie importabilité + présence des attributs requis.
+    Retourne liste vide si OK, liste de manquants sinon.
+    Ne vérifie PAS les modules optionnels (voir _check_optional_modules).
+    """
     checks  = _REQUIRED_DAILY + (extra or [])
     missing: list[str] = []
     for module_name, attr_name in checks:
@@ -209,6 +202,28 @@ def _check_dependencies(extra: list[tuple[str, str]] | None = None) -> list[str]
         except ImportError:
             missing.append(f"{module_name} (module absent)")
     return missing
+
+
+def _check_optional_modules() -> None:
+    """
+    [MAIN-54-FIX4] Vérifie les modules optionnels une seule fois au démarrage.
+    Loggue en INFO si présent, WARNING si absent — sans bloquer le pipeline.
+    """
+    for module_name, attr_name in _OPTIONAL_MODULES:
+        try:
+            mod = __import__(module_name)
+            if hasattr(mod, attr_name):
+                logger.info(f"MODULE OPTIONNEL OK : {module_name}.{attr_name}()")
+            else:
+                logger.warning(
+                    f"MODULE OPTIONNEL : {module_name}.{attr_name}() absent "
+                    f"— fonctionnalité désactivée"
+                )
+        except ImportError:
+            logger.warning(
+                f"MODULE OPTIONNEL : {module_name} absent "
+                f"(pip install scikit-learn numpy) — NLP rerank désactivé"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -223,79 +238,94 @@ def _timed(label: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# HEALTH SERVER (Idempotent)
+# HEALTH SERVER — MAIN-52-FIX7 : lock threading
 # ---------------------------------------------------------------------------
 _HEALTH_SERVER_STARTED = False
+_HEALTH_LOCK           = threading.Lock()
 
-def _ensure_health_server():
+
+def _ensure_health_server() -> None:
+    """
+    Démarre le serveur HTTP de healthcheck en thread daemon.
+    Protégé par un lock pour éviter un double démarrage théorique.
+    """
     global _HEALTH_SERVER_STARTED
-    if _HEALTH_SERVER_STARTED:
-        return
+    with _HEALTH_LOCK:
+        if _HEALTH_SERVER_STARTED:
+            return
 
-    try:
-        port = int(os.environ.get("SENTINEL_HEALTH_PORT", "8765"))
-    except ValueError:
-        logger.warning("SENTINEL_HEALTH_PORT invalide — port 8765 par défaut")
-        port = 8765
-
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path in ["/health", "/"]:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "status":  "ok",
-                    "version": VERSION,
-                    "ts":      datetime.datetime.now().isoformat(),
-                }).encode())
-            else:
-                self.send_response(404)
-                self.end_headers()
-        def log_message(self, *args): pass
-
-    def run_server():
         try:
-            HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-        except Exception:
-            pass
+            port = int(os.environ.get("SENTINEL_HEALTH_PORT", "8765"))
+        except ValueError:
+            logger.warning("SENTINEL_HEALTH_PORT invalide — port 8765 par défaut")
+            port = 8765
 
-    threading.Thread(target=run_server, daemon=True).start()
-    _HEALTH_SERVER_STARTED = True
-    logger.info(f"Health server actif sur port {port}")
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path in ["/health", "/"]:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps({
+                            "status":  "ok",
+                            "version": VERSION,
+                            "ts":      datetime.datetime.now().isoformat(),
+                        }).encode()
+                    )
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args: Any) -> None:
+                pass  # silencieux
+
+        def _run_server() -> None:
+            try:
+                HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+            except Exception:
+                pass
+
+        threading.Thread(target=_run_server, daemon=True).start()
+        _HEALTH_SERVER_STARTED = True
+        logger.info(f"Health server actif sur port {port}")
 
 
 # ---------------------------------------------------------------------------
 # IMPORTS DES MODULES SENTINEL
 # ---------------------------------------------------------------------------
-from scraper_rss import scrape_all_feeds, format_for_claude
-from memory_manager import get_compressed_memory, update_memory
-from sentinel_api import run_sentinel, extract_metrics_from_report, extract_memory_delta
-from charts import generate_all_charts
-from report_builder import build_html_report, purge_old_reports
-from mailer import send_report
-from db_manager import SentinelDB, closedb, initdb
-from samgov_scraper import run_all_procurement
+from scraper_rss    import scrape_all_feeds, format_for_claude           # noqa: E402
+from memory_manager import get_compressed_memory, update_memory           # noqa: E402
+from sentinel_api   import (                                               # noqa: E402
+    run_sentinel,
+    extract_metrics_from_report,
+    extract_memory_delta,
+)
+from charts         import generate_all_charts                             # noqa: E402
+from report_builder import build_html_report, purge_old_reports            # noqa: E402
+from mailer         import send_report                                     # noqa: E402
+from db_manager     import SentinelDB, closedb, initdb                     # noqa: E402
+from samgov_scraper import run_all_procurement                             # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# SCRAPERS OPTIONNELS
+# SCRAPERS OPTIONNELS — MAIN-41-FIX4
 # ---------------------------------------------------------------------------
-def _load_optional_scraper(name: str, module_path: str):
+def _load_optional_scraper(name: str, module_path: str) -> Any:
     if Path(module_path).exists():
         try:
             spec = ilu.spec_from_file_location(name, module_path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"Spec introuvable pour {module_path}")
             mod = ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
             return mod
         except Exception as e:
             logger.warning(f"Erreur chargement {name}: {e}")
     return None
+
 
 telegram_mod = _load_optional_scraper("telegram_scraper", "telegram_scraper.py")
 patents_mod  = _load_optional_scraper("ops_patents",       "ops_patents.py")
@@ -306,31 +336,48 @@ github_mod   = _load_optional_scraper("github_scraper",    "github_scraper.py")
 # LOGIQUE DE SAUVEGARDE (Centralisée)
 # ---------------------------------------------------------------------------
 def _process_report_data_to_db(
-    report_text: str,
-    metrics: dict,
-    date_iso: str,
+    report_text:      str,
+    metrics:          dict,
+    date_iso:         str,
     github_days_back: int = 0,
-):
+) -> None:
     """
     Sauvegarde métriques, rapport, tendances et alertes dans SentinelDB.
-    [MAIN-48-B] github_days_back : 0 = pas de GitHub, >0 = fenêtre effective.
+
+    [MAIN-48-B]    github_days_back : 0 = pas de GitHub, >0 = fenêtre effective.
+    [MAIN-52-FIX1] Log WARNING si github_days_back risque d'être rejeté par DB.
+                   Correction définitive requise dans db_manager.py :
+                   ajouter "github_days_back" dans _ALLOWED_METRIC_COLS et le DDL.
+    [MAIN-52-FIX2] deltas = extract_memory_delta(...) or {} — guard contre None.
+    [MAIN-51-FIX2] compressed = texte Claude complet (phase MAP mensuelle).
     """
+    if github_days_back > 0:
+        logger.warning(
+            f"DB savemetrics: github_days_back={github_days_back} transmis. "
+            f"Vérifier que 'github_days_back' est dans _ALLOWED_METRIC_COLS "
+            f"ET dans le DDL de db_manager.py — sinon la valeur est rejetée "
+            f"silencieusement et le système anti-biais GitHub est inopérant. "
+            f"(BUG-DB-1 — correction requise dans db_manager.py)"
+        )
+
     SentinelDB.savemetrics(
         date_iso,
-        indice=metrics.get("indice", 5.0),
-        alerte=metrics.get("alerte", "VERT"),
-        nb_articles=metrics.get("nb_articles", 0),
-        nb_pertinents=metrics.get("nb_pertinents", 0),
-        github_days_back=github_days_back,
+        indice           = metrics.get("indice",        5.0),
+        alerte           = metrics.get("alerte",        "VERT"),
+        nb_articles      = metrics.get("nb_articles",   0),
+        nb_pertinents    = metrics.get("nb_pertinents", 0),
+        github_days_back = github_days_back,
     )
+
     SentinelDB.savereport(
-        date=date_iso,
-        indice=metrics.get("indice", 5.0),
-        alerte=metrics.get("alerte", "VERT"),
-        compressed=json.dumps(metrics),
-        rawtail=report_text[:3000],
+        date       = date_iso,
+        indice     = metrics.get("indice", 5.0),
+        alerte     = metrics.get("alerte", "VERT"),
+        compressed = report_text,        # texte Claude complet — phase MAP mensuelle
+        rawtail    = report_text[:3000],  # troncature — requêtes rapides dashboard
     )
-    deltas = extract_memory_delta(report_text)
+
+    deltas = extract_memory_delta(report_text) or {}  # MAIN-52-FIX2
     for t in deltas.get("nouvelles_tendances", []):
         SentinelDB.savetendance(t, date_iso)
     for a in deltas.get("alertes_ouvertes", []):
@@ -340,17 +387,49 @@ def _process_report_data_to_db(
 
 
 # ---------------------------------------------------------------------------
+# EXPORT CSV OPTIONNEL
+# ---------------------------------------------------------------------------
+def _maybe_export_csv() -> dict:
+    """
+    Lance l'export CSV si SENTINEL_EXPORT_CSV=1 dans .env.
+    [MAIN-54-FIX3] Guard hasattr() — évite AttributeError si SentinelDB.export_csv
+    est absent de db_manager.py.
+    Retourne un dict {nom: Path} des fichiers générés, vide si désactivé ou absent.
+    """
+    if os.environ.get("SENTINEL_EXPORT_CSV", "0") != "1":
+        return {}
+    if not hasattr(SentinelDB, "export_csv"):
+        logger.warning(
+            "SENTINEL_EXPORT_CSV=1 mais SentinelDB.export_csv() absent "
+            "— export désactivé. Ajouter la méthode dans db_manager.py."
+        )
+        return {}
+    try:
+        csv_exports = _timed("csv_export", SentinelDB.export_csv)
+        logger.info(f"CSV exportés : {list(csv_exports.keys())}")
+        return csv_exports
+    except Exception as e:
+        logger.warning(f"Export CSV non bloquant : {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # PIPELINE QUOTIDIEN
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
     logger.info(f"=== DEMARRAGE SENTINEL v{VERSION} ===")
     start_time = timeperf.perf_counter()
     initdb()
     _ensure_health_server()
 
+    # [MAIN-54-FIX4] Modules optionnels vérifiés une seule fois au démarrage
+    _check_optional_modules()
+
     missing = _check_dependencies()
     if missing:
-        logger.error(f"DEPENDANCES MANQUANTES — pipeline annulé : {', '.join(missing)}")
+        logger.error(
+            f"DEPENDANCES MANQUANTES — pipeline annulé : {', '.join(missing)}"
+        )
         return
 
     date_obj = datetime.datetime.now(datetime.timezone.utc).date()
@@ -358,7 +437,7 @@ def main():
 
     try:
         # ── 1. COLLECTE ──────────────────────────────────────────────────────
-        articles = _timed("scrape_rss", scrape_all_feeds)
+        articles: list[dict] = _timed("scrape_rss", scrape_all_feeds)
 
         if telegram_mod:
             try:
@@ -367,26 +446,29 @@ def main():
             except Exception as e:
                 logger.warning(f"Erreur Telegram: {e}")
 
+        # [MAIN-52-FIX5] Cap contrats pour éviter overflow tokens
         try:
             contracts = _timed("procurement", run_all_procurement, daysback=2)
-            articles.extend(contracts)
-            logger.info(f"Procurement : {len(contracts)} contrats ajoutés")
+            contracts_capped = (contracts or [])[:MAX_CONTRACTS]
+            if len(contracts or []) > MAX_CONTRACTS:
+                logger.warning(
+                    f"Procurement : {len(contracts)} contrats → capé à {MAX_CONTRACTS} "
+                    f"(configurer SENTINEL_MAX_CONTRACTS dans .env)"
+                )
+            articles.extend(contracts_capped)
+            logger.info(f"Procurement : {len(contracts_capped)} contrats ajoutés")
         except Exception as e:
             logger.warning(f"Erreur Procurement (non bloquant) : {e}")
 
-        # ── GitHub — MAIN-46-A / MAIN-47-A ───────────────────────────────────
-        has_github     = False
-        last_run_iso   = None
-        effective_days = DAYS_BACK_CFG
+        # ── GitHub — MAIN-52-FIX3 : une seule lecture fichier ────────────────
+        has_github:     bool      = False
+        last_run_iso:   str | None = None
+        effective_days: int        = DAYS_BACK_CFG
 
         if github_mod:
-            should_run, effective_days = _should_run_github()
+            should_run, effective_days, last_run_iso = _should_run_github()
             if should_run:
                 try:
-                    if _GITHUB_LAST_RUN_PATH.exists():
-                        last_run_iso = _GITHUB_LAST_RUN_PATH.read_text(
-                            encoding="utf-8"
-                        ).strip()
                     github_arts = _timed(
                         "github", github_mod.run_github_scraper, effective_days
                     )
@@ -413,25 +495,25 @@ def main():
         formatted_data = format_for_claude(articles)
         memory_context = get_compressed_memory()
 
-        # [MAIN-48-A] <system_notice> si rattrapage GitHub détecté
+        # [MAIN-48-A] Injection <system_notice> si rattrapage GitHub
         if has_github and effective_days > GITHUB_COOLDOWN_DAYS:
             catchup_date_str = (
                 f"le {last_run_iso}" if last_run_iso
                 else f"il y a plus de {effective_days} jours"
             )
             catchup_note = (
-                f"<system_notice>
+                "<system_notice>
 "
                 f"RATTRAPAGE GITHUB : la veille R&D n'a pas pu être exécutée "
                 f"normalement. Fenêtre élargie à {effective_days} jours "
                 f"(dernière exécution : {catchup_date_str}). "
-                f"Le volume d'articles GitHub est supérieur à la normale — "
-                f"ne pas interpréter ce volume comme un pic d'activité soudain. "
+                "Le volume d'articles GitHub est supérieur à la normale — "
+                "ne pas interpréter ce volume comme un pic d'activité soudain. "
                 f"Mentionner ce rattrapage dans la section Veille R&D (MODULE 4-BIS) "
                 f"sous la forme : 'Note : analyse R&D élargie à {effective_days}j "
                 f"(rattrapage du cycle manqué {catchup_date_str})'.
 "
-                f"</system_notice>
+                "</system_notice>
 
 "
             )
@@ -450,8 +532,8 @@ def main():
             formatted_data,
             memory_context,
             date_obj,
-            model=SONNET_MODEL,
-            report_type=report_type,
+            model       = SONNET_MODEL,
+            report_type = report_type,
         )
         if not report_text:
             raise RuntimeError("Claude n'a retourné aucun rapport.")
@@ -466,11 +548,30 @@ def main():
         )
 
         # ── 4. RESTITUTION ───────────────────────────────────────────────────
-        _timed("charts",         generate_all_charts,  report_text)
-        html_report = _timed("report_builder", build_html_report, report_text, metrics)
+        # chart_dict peut être un dict {nom: path} ou une list — on normalise
+        chart_dict  = _timed("charts", generate_all_charts, report_text)
+        chart_paths = (
+            list(chart_dict.values()) if isinstance(chart_dict, dict)
+            else (chart_dict or [])
+        )
+
+        html_report = _timed(
+            "report_builder",
+            build_html_report,
+            report_text,
+            chart_paths,
+            date_obj,
+        )
+
+        csv_attachments = _maybe_export_csv()
 
         if html_report and Path(html_report).exists():
-            _timed("mailer", send_report, html_report)
+            _timed(
+                "mailer",
+                send_report,
+                html_report,
+                csv_attachments=csv_attachments if csv_attachments else None,
+            )
             logger.info(f"Rapport envoyé : {html_report}")
 
         # ── 5. MAINTENANCE ───────────────────────────────────────────────────
@@ -493,20 +594,16 @@ def main():
 # ---------------------------------------------------------------------------
 # RAPPORT MENSUEL
 # ---------------------------------------------------------------------------
-def run_monthly_report():
+def run_monthly_report() -> None:
     """
     Rapport mensuel SENTINEL via MapReduce.
 
     Phase MAP    : Haiku compresse chaque rapport journalier (parallèle, 8 workers)
     Phase REDUCE : blocs hebdo → Sonnet → rapport mensuel final
 
-    Annotations de biais (v3.48 → v3.50) :
-        MAIN-48-C  Annotation locale [RATTRAPAGE GITHUB Xj + densité] dans le
-                   titre de chaque bloc hebdo atypique.
-        MAIN-49-A  <context_metadata> en tête d'injection si ≥1 semaine atypique.
-        MAIN-50-A  Densité normalisée articles/jour intégrée aux deux annotations.
-                   Calcul déterministe depuis DB (nb_articles / effective_window).
-                   Zéro appel API supplémentaire — données déjà en base depuis v3.41.
+    [MAIN-54-FIX2] date_obj_monthly extrait en tête de fonction (unique calcul).
+    [MAIN-52-FIX4] Guard "if not filled" avant REDUCE.
+    [MAIN-53-FIX1] fallback_text en variable intermédiaire (pas de backslash en f-string).
     """
     logger.info(f"=== DEMARRAGE RAPPORT MENSUEL SENTINEL v{VERSION} ===")
     start_time = timeperf.perf_counter()
@@ -520,12 +617,15 @@ def run_monthly_report():
         closedb()
         return
 
-    date_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-    mois     = datetime.datetime.now(datetime.timezone.utc).strftime("%B %Y")
+    # [MAIN-54-FIX2] Calcul unique — réutilisé dans savereport + build_html_report
+    now_utc          = datetime.datetime.now(datetime.timezone.utc)
+    date_obj_monthly = now_utc.date()
+    date_iso         = date_obj_monthly.isoformat()
+    mois             = now_utc.strftime("%B %Y")
 
     try:
-        from memory_manager import compress_text_haiku
-        from sentinel_api import run_sentinel_monthly
+        from memory_manager import compress_text_haiku   # noqa: PLC0415
+        from sentinel_api   import run_sentinel_monthly  # noqa: PLC0415
 
         # ── Récupération des 30 derniers rapports ─────────────────────────
         rows = SentinelDB.get_last_n_reports(30)
@@ -533,9 +633,7 @@ def run_monthly_report():
             logger.warning("run_monthly_report : aucun rapport en base — abandon.")
             return
 
-        # [MAIN-48-C / MAIN-50-A] Un seul appel getmetrics() pour :
-        #   - github_days_back (annotation rattrapage)
-        #   - nb_articles      (densité normalisée)
+        # Un seul appel getmetrics() pour github_days_back + nb_articles
         metrics_by_date:  dict[str, int] = {}
         articles_by_date: dict[str, int] = {}
         try:
@@ -552,9 +650,14 @@ def run_monthly_report():
 
         logger.info(f"MapReduce mensuel : {len(rows)} rapports récupérés")
 
-        # ── Phase MAP parallèle — MAIN-44-FIX1 ───────────────────────────
-        raw_texts:    list[str]  = [(row.get("rawtail") or "").strip() for row in rows]
-        indexed_raws: list[tuple[int, str]] = [
+        # ── Phase MAP parallèle ───────────────────────────────────────────
+        # compressed en priorité (texte Claude complet depuis v3.52),
+        # rawtail en fallback (anciens rapports pré-v3.51)
+        raw_texts: list[str] = [
+            (row.get("compressed") or row.get("rawtail") or "").strip()
+            for row in rows
+        ]
+        indexed_raws:       list[tuple[int, str]] = [
             (i, t) for i, t in enumerate(raw_texts) if t
         ]
         compressed_reports: list[str] = [""] * len(rows)
@@ -566,8 +669,10 @@ def run_monthly_report():
             idx, raw = args
             try:
                 return idx, compress_text_haiku(raw)
-            except Exception as e:
-                logger.warning(f"MAP rapport {idx + 1} : erreur Haiku ({e}) — fallback")
+            except Exception as exc:
+                logger.warning(
+                    f"MAP rapport {idx + 1} : erreur Haiku ({exc}) — fallback"
+                )
                 return idx, raw[:300]
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -579,9 +684,9 @@ def run_monthly_report():
                 try:
                     idx, summary = future.result()
                     compressed_reports[idx] = summary
-                except Exception as e:
+                except Exception as exc:
                     orig_idx = futures[future]
-                    logger.warning(f"MAP future {orig_idx + 1} : erreur ({e})")
+                    logger.warning(f"MAP future {orig_idx + 1} : erreur ({exc})")
                     compressed_reports[orig_idx] = raw_texts[orig_idx][:300]
 
         filled: list[tuple[str, str]] = [
@@ -596,27 +701,33 @@ def run_monthly_report():
             f"{elapsed_map:.1f}s — {sum(len(s) for s, _ in filled)} chars total"
         )
 
+        # [MAIN-52-FIX4] Guard — évite un appel Sonnet sur chaîne vide
+        if not filled:
+            logger.error(
+                "REDUCE mensuel : aucun rapport compressé disponible — abandon. "
+                "Vérifier que des rapports journaliers existent en base "
+                "(colonne reports.compressed ou reports.rawtail)."
+            )
+            return
+
         # ── Phase REDUCE : regroupement par semaine ───────────────────────
         def _chunk(lst: list, size: int) -> list[list]:
             return [lst[i:i + size] for i in range(0, len(lst), size)]
 
-        weekly_summaries: list[str] = []
-        # [MAIN-49-A / MAIN-50-A] tuple élargi : (numéro_semaine, max_gdb, density)
-        catchup_weeks: list[tuple[int, int, float]] = []
+        weekly_summaries: list[str]                    = []
+        catchup_weeks:    list[tuple[int, int, float]] = []
+        chunks = _chunk(filled, 7)  # calculé une seule fois
 
-        for w_idx, week in enumerate(_chunk(filled, 7), 1):
+        for w_idx, week in enumerate(chunks, 1):
             week_texts = [s for s, _ in week]
             week_dates = [d for _, d in week]
 
-            # Détection rattrapage
             max_gdb = max(
                 (metrics_by_date.get(d, 0) for d in week_dates if d),
                 default=0,
             )
 
-            # [MAIN-50-A] Densité normalisée : articles totaux / fenêtre effective
-            # effective_window = max_gdb si rattrapage, sinon COOLDOWN (cycle normal)
-            # Déterministe : nb_articles exact depuis DB, division simple.
+            # [MAIN-50-A] Densité normalisée articles/jour
             total_articles   = sum(articles_by_date.get(d, 0) for d in week_dates if d)
             effective_window = (
                 max_gdb if max_gdb > GITHUB_COOLDOWN_DAYS
@@ -627,11 +738,9 @@ def run_monthly_report():
                 if effective_window > 0 else 0.0
             )
 
-            # [MAIN-49-A / MAIN-50-A] Mémorisation pour <context_metadata>
             if max_gdb > GITHUB_COOLDOWN_DAYS:
                 catchup_weeks.append((w_idx, max_gdb, density))
 
-            # [MAIN-48-C + MAIN-50-A] Annotation locale enrichie avec densité
             catchup_flag = (
                 f" [RATTRAPAGE GITHUB {max_gdb}j | "
                 f"densité normalisée : {density} articles/jour | "
@@ -643,7 +752,7 @@ def run_monthly_report():
             if catchup_flag:
                 logger.info(
                     f"REDUCE semaine {w_idx} : "
-                    f"max_gdb={max_gdb}j, density={density} articles/jour → annotation"
+                    f"max_gdb={max_gdb}j, density={density} art/j → annotation"
                 )
 
             try:
@@ -658,11 +767,14 @@ def run_monthly_report():
                     f"[SEMAINE {w_idx}{catchup_flag}]
 {w_summary}"
                 )
-            except Exception as e:
-                logger.warning(f"REDUCE semaine {w_idx} : {e}")
+            except Exception as exc:
+                logger.warning(f"REDUCE semaine {w_idx} : {exc}")
+                # [MAIN-53-FIX1] Variable intermédiaire — backslash interdit en f-string
+                fallback_text = "
+".join(week_texts)[:500]
                 weekly_summaries.append(
                     f"[SEMAINE {w_idx}{catchup_flag}]
-{chr(10).join(week_texts)[:500]}"
+{fallback_text}"
                 )
 
         injection = "
@@ -671,15 +783,17 @@ def run_monthly_report():
 
         # [MAIN-49-A + MAIN-50-A] <context_metadata> si ≥1 semaine atypique
         if catchup_weeks:
-            # Semaines normales pour référence de densité (comparaison explicite)
-            normal_weeks_densities = [
+            catchup_set = {w for w, _, _ in catchup_weeks}
+
+            normal_weeks_densities: list[tuple[int, float]] = [
                 (i + 1, round(
-                    sum(articles_by_date.get(d, 0) for d in [dt for _, dt in chunk])
+                    sum(articles_by_date.get(d, 0) for _, d in chunk)
                     / GITHUB_COOLDOWN_DAYS, 1
                 ))
-                for i, chunk in enumerate(_chunk(filled, 7))
-                if (i + 1) not in {w for w, _, _ in catchup_weeks}
+                for i, chunk in enumerate(chunks)
+                if (i + 1) not in catchup_set
             ]
+
             normal_ref_str = ""
             if normal_weeks_densities:
                 avg_normal = round(
@@ -688,8 +802,8 @@ def run_monthly_report():
                 )
                 normal_ref_str = (
                     f"Densité moyenne des semaines normales : {avg_normal} articles/jour. "
-                    f"Si la densité normalisée des semaines de rattrapage est proche "
-                    f"de cette valeur, confirmer l'absence de pic d'activité réel.
+                    "Si la densité normalisée des semaines de rattrapage est proche "
+                    "de cette valeur, confirmer l'absence de pic d'activité réel.
 "
                 )
 
@@ -702,7 +816,7 @@ def run_monthly_report():
             )
             normal_weeks_list = [
                 i for i in range(1, len(weekly_summaries) + 1)
-                if i not in {w for w, _, _ in catchup_weeks}
+                if i not in catchup_set
             ]
             normal_str = (
                 f"Semaines {', '.join(str(w) for w in normal_weeks_list)} : "
@@ -711,33 +825,32 @@ def run_monthly_report():
             )
 
             context_metadata = (
-                f"<context_metadata>
+                "<context_metadata>
 "
                 f"BIAIS DE COLLECTE — RAPPORT MENSUEL {mois.upper()}
 "
-                f"Les semaines suivantes présentent un volume GitHub anormalement "
-                f"élevé dû à un rattrapage de cycle :
+                "Les semaines suivantes présentent un volume GitHub anormalement "
+                "élevé dû à un rattrapage de cycle :
 "
                 f"{lines}
 "
                 f"{normal_str}
 "
                 f"{normal_ref_str}"
-                f"Consignes applicables à l'INTÉGRALITÉ du rapport :
+                "Consignes applicables à l'INTÉGRALITÉ du rapport :
 "
-                f"  1. Ne pas surpondérer l'activité GitHub des semaines annotées "
-                f"dans les tendances long-terme.
+                "  1. Ne pas surpondérer l'activité GitHub des semaines annotées "
+                "dans les tendances long-terme.
 "
-                f"  2. La densité normalisée (articles/jour) est la métrique "
-                f"pertinente, pas le volume total — utiliser cette densité pour "
-                f"évaluer si l'activité est réellement supérieure à la normale.
+                "  2. La densité normalisée (articles/jour) est la métrique "
+                "pertinente, pas le volume total.
 "
-                f"  3. Si la densité normalisée est comparable aux semaines normales, "
-                f"conclure explicitement à l'absence de pic d'activité.
+                "  3. Si la densité normalisée est comparable aux semaines normales, "
+                "conclure explicitement à l'absence de pic d'activité.
 "
-                f"  4. Mentionner ce rattrapage en note méthodologique en fin de rapport.
+                "  4. Mentionner ce rattrapage en note méthodologique en fin de rapport.
 "
-                f"</context_metadata>
+                "</context_metadata>
 
 "
             )
@@ -767,28 +880,53 @@ def run_monthly_report():
 
         metrics = extract_metrics_from_report(report_text, date_iso)
 
-        SentinelDB.savereport(
-            date=date_iso,
-            indice=(metrics or {}).get("indice", 5.0),
-            alerte=(metrics or {}).get("alerte", "VERT"),
-            compressed=json.dumps({
+        # compressed = texte mensuel brut, rawtail = JSON métadonnées audit
+        monthly_meta = json.dumps(
+            {
                 "type":          "monthly",
                 "mois":          mois,
-                # [MAIN-50-A] density persistée pour audit futur
                 "catchup_weeks": [
                     {"semaine": w, "gdb": g, "density": d}
                     for w, g, d in catchup_weeks
                 ],
                 **(metrics or {}),
-            }),
-            rawtail=report_text[:3000],
+            },
+            ensure_ascii=False,
         )
 
-        html_report = _timed(
-            "report_builder_monthly", build_html_report, report_text, metrics
+        SentinelDB.savereport(
+            date       = date_iso,
+            indice     = (metrics or {}).get("indice", 5.0),
+            alerte     = (metrics or {}).get("alerte", "VERT"),
+            compressed = report_text,   # texte mensuel brut
+            rawtail    = monthly_meta,  # JSON métadonnées audit
         )
+
+        chart_dict_monthly  = _timed("charts_monthly", generate_all_charts, report_text)
+        chart_paths_monthly = (
+            list(chart_dict_monthly.values())
+            if isinstance(chart_dict_monthly, dict)
+            else (chart_dict_monthly or [])
+        )
+
+        # [MAIN-54-FIX2] date_obj_monthly déjà calculé en tête — pas de double appel
+        html_report = _timed(
+            "report_builder_monthly",
+            build_html_report,
+            report_text,
+            chart_paths_monthly,
+            date_obj_monthly,
+        )
+
+        csv_attachments = _maybe_export_csv()
+
         if html_report and Path(html_report).exists():
-            _timed("mailer_monthly", send_report, html_report)
+            _timed(
+                "mailer_monthly",
+                send_report,
+                html_report,
+                csv_attachments=csv_attachments if csv_attachments else None,
+            )
             logger.info(f"Rapport mensuel envoyé : {html_report}")
 
         elapsed = timeperf.perf_counter() - start_time
@@ -797,7 +935,10 @@ def run_monthly_report():
     except Exception as e:
         logger.error(f"CRASH RAPPORT MENSUEL: {e}", exc_info=True)
         try:
-            send_report(None, subject=f"[SENTINEL CRASH MENSUEL] {type(e).__name__}: {e}")
+            send_report(
+                None,
+                subject=f"[SENTINEL CRASH MENSUEL] {type(e).__name__}: {e}",
+            )
         except Exception:
             pass
     finally:
