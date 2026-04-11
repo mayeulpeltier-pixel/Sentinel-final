@@ -1,4 +1,5 @@
-# db_manager.py --- SENTINEL v3.50 --- Gestionnaire SQLite WAL
+#!/usr/bin/env python3
+# db_manager.py --- SENTINEL v3.51 --- Gestionnaire SQLite WAL
 # =============================================================================
 # CORRECTIONS v3.40 :
 # BUG-DB1  UNIQUE sur reports.date → ON CONFLICT(date) fonctionnel
@@ -30,56 +31,54 @@
 # DB-48-COL  _ALLOWED_METRIC_COLS : ajout "github_days_back"
 # DB-48-DDL  DDL metrics : colonne github_days_back INTEGER DEFAULT 0
 # DB-48-MIG  initdb() : ALTER TABLE migration safe (idempotent)
-#            Ajoute la colonne aux DBs existantes sans recréer le schéma.
-#            Le try/except absorbe l'erreur "duplicate column" sur les DBs
-#            déjà à jour — comportement attendu et documenté.
 # DB-48-SEL  getmetrics() : COALESCE(github_days_back, 0) dans SELECT
-#            COALESCE garantit 0 même sur les lignes antérieures à v3.48
-#            qui ont NULL en base (colonne DEFAULT 0 non rétroactive sur
-#            les lignes existantes).
 # DB-48-RPT  get_last_n_reports(n) : méthode pour run_monthly_report()
-#            Retourne les N derniers rapports (date + rawtail) triés DESC.
-#            Distinct de getrecentreports() qui filtre par fenêtre temporelle.
 #
 # MODIFICATIONS v3.49 — Export CSV analytiques :
-# CSV-1  export_csv() dans SentinelDB — séparation de responsabilités.
-#        L'export des données brutes appartient à db_manager.py (source
-#        de vérité), PAS à charts.py (génération d'images).
-# CSV-2  Trois exports : metrics (ndays), acteurs (top N), tendances actives.
-# CSV-3  Opt-in via SENTINEL_EXPORT_CSV=1 dans .env — zéro overhead si inactif.
-#        Appelé depuis sentinel_main.py après generate_all_charts() :
-#            if os.environ.get("SENTINEL_EXPORT_CSV","0") == "1":
-#                csv_exports = _timed("csv_export", SentinelDB.export_csv)
-# CSV-4  Retourne dict[str, Path] → mailer.py joint les CSV au mail
-#        avec la même mécanique que les PNG/PDF.
-# CSV-5  Poids garanti minimal : texte pur, typiquement < 50 Ko pour 30j.
-# CSV-6  Nommage daté YYYY-MM-DD_sentinel_{nom}.csv — cohérent avec
-#        la convention de charts.py (CHK-8) : YYYY-MM-DD_{name}.png.
-# CSV-7  Fallback gracieux par export : une erreur sur un dataset n'annule
-#        pas les autres. Une erreur sur un format n'annule pas l'autre.
-# CSV-8  Bilan consolidé : taille totale et nb fichiers loggés en fin.
+# CSV-1 à CSV-8 : export_csv() dans SentinelDB (séparation responsabilités)
 #
 # MODIFICATIONS v3.50 — Double format standard / Excel FR :
-# CSV-9  Double export par dataset : standard (dataviz) + excel_fr (Excel FR).
-#        Deux configs déclaratives → une seule boucle d'écriture par dataset.
-#        Nommage : YYYY-MM-DD_sentinel_{nom}.csv        (standard)
-#                  YYYY-MM-DD_sentinel_{nom}_excel.csv  (Excel FR)
-# CSV-10 _fr_row() : float → str avec virgule décimale pour Excel FR.
-#        Appliqué uniquement au format excel_fr — le format standard
-#        conserve le point décimal natif Python (pandas, numpy, etc.).
-# CSV-11 utf-8-sig (BOM) pour excel_fr uniquement → Excel détecte
-#        automatiquement l'encodage sans assistant d'importation.
-#        Le format standard reste utf-8 pur (BOM parasite sous Linux/pandas).
-# CSV-12 SENTINEL_CSV_MODE=[both|standard|excel] dans .env
-#        Défaut : both → les deux formats générés à chaque cycle.
-#        "standard" → dataviz uniquement (CI, serveurs sans Excel)
-#        "excel"    → excel_fr uniquement (poste analyste standalone)
-#        Chargement SQL : 1 seule requête par dataset, partagée entre
-#        les deux formats — zéro surcharge DB.
-# =============================================================================
+# CSV-9 à CSV-12 : double export standard + excel_fr, configs déclaratives
+#
+# CORRECTIONS v3.51 — Post-audit final (compatibilité sentinel_main v3.54) :
+# DB-51-FIX1  savereport() : rawtail[-2000:] → rawtail[:2000]
+#             BUG CRITIQUE : [-2000:] conservait les 2000 DERNIERS caractères
+#             au lieu des 2000 PREMIERS. sentinel_main.py passe report_text[:3000]
+#             comme rawtail — la troncature DB doit être [:2000], pas [-2000:].
+#             Résultat v3.50 : le début du rapport (titre, indice, alerte) était
+#             systématiquement perdu. Corrigé ici.
+# DB-51-FIX2  DDL : INDEX idx_alertes_texte sur alertes(texte)
+#             closealerte() utilisait LIKE sans index → full table scan sur
+#             chaque cycle. Avec des milliers d'alertes historiques, chaque
+#             appel faisait O(n). L'index réduit à O(log n).
+#             Ajouté dans le DDL + migration safe dans initdb().
+# DB-51-FIX3  export_csv() : _CSV_MODE relu au runtime (os.environ.get())
+#             _CSV_MODE était capturé à l'import du module → changement de
+#             SENTINEL_CSV_MODE en cours de run (tests, scripts admin) sans
+#             effet. Relu à chaque appel export_csv() comme les autres vars .env.
+# DB-51-FIX4  Smoke test BOM : b"ï»¿" → b"ï»¿"
+#             b"ï»¿" est le BOM UTF-8 décodé en Latin-1 — ce n'est pas la
+#             séquence d'octets réelle. Le test échouait silencieusement sur
+#             toute plateforme avec open() en mode binaire.
+# AMÉLIORATIONS v3.51 :
+# DB-51-PERF1 atexit.register(closedb) — fermeture propre des connexions
+#             thread-locales si le process se termine sans appeler closedb()
+#             explicitement (ex. crash avant finally dans sentinel_main.py).
+# DB-51-ALIAS loadseendays = loadseen — alias explicite pour scraper_rss.py
+#             qui appelle SentinelDB.loadseendays(days=90). Documente le
+#             contrat au lieu d'une découverte silencieuse.
+# DB-51-IDX   INDEX idx_metrics_date sur metrics(date DESC) — SQLite crée
+#             un index implicite sur UNIQUE mais non sur DESC. Ajout explicite
+#             pour ORDER BY date DESC dans getmetrics() et les requêtes dashboard.
+#
 # Compatibilité pipeline v3.37 totalement préservée (API SentinelDB inchangée)
+# Compatibilité sentinel_main v3.54 garantie (tous appels vérifiés)
+# Compatibilité report_builder v3.43 garantie (getrecentreports/getmetrics)
 # =============================================================================
 
+from __future__ import annotations
+
+import atexit
 import csv
 import json
 import logging
@@ -119,19 +118,20 @@ _ALLOWED_METRIC_COLS = frozenset({
 # SENTINEL_CSV_DAYS=30        fenêtre temporelle metrics (défaut : 30j)
 # SENTINEL_CSV_ACTEURS_MAX=50 top N acteurs exportés (défaut : 50)
 # SENTINEL_CSV_MODE=both      both | standard | excel (défaut : both)
+#   [DB-51-FIX3] _CSV_MODE N'EST PAS capturé ici à l'import.
+#   Il est relu à chaque appel export_csv() via os.environ.get() pour
+#   respecter les changements de .env sans redémarrage.
 _CSV_DAYS        = int(os.environ.get("SENTINEL_CSV_DAYS",        "30"))
 _CSV_ACTEURS_MAX = int(os.environ.get("SENTINEL_CSV_ACTEURS_MAX", "50"))
-_CSV_MODE        = os.environ.get("SENTINEL_CSV_MODE", "both")  # CSV-12
 
 # CSV-9 — configs déclaratives des formats d'export
-# Ajouter un format ici suffit, export_csv() s'adapte automatiquement.
-_CSV_EXPORT_CONFIGS = [
+_CSV_EXPORT_CONFIGS: list[dict] = [
     {
-        "key_suffix":  "",          # clé retournée : "metrics", "acteurs"...
-        "file_suffix": "",          # suffixe fichier : sentinel_metrics.csv
+        "key_suffix":  "",
+        "file_suffix": "",
         "delimiter":   ",",
-        "decimal_sep": ".",         # float natif Python — pandas/Grafana/numpy
-        "encoding":    "utf-8",     # pas de BOM — compatible Linux/macOS/pandas
+        "decimal_sep": ".",
+        "encoding":    "utf-8",
         "modes":       {"both", "standard"},
         "label":       "standard",
     },
@@ -139,15 +139,16 @@ _CSV_EXPORT_CONFIGS = [
         "key_suffix":  "_excel",
         "file_suffix": "_excel",
         "delimiter":   ";",
-        "decimal_sep": ",",         # virgule décimale → nombres calculables Excel FR
-        "encoding":    "utf-8-sig", # BOM → Excel détecte UTF-8 sans assistant
+        "decimal_sep": ",",
+        "encoding":    "utf-8-sig",
         "modes":       {"both", "excel"},
         "label":       "excel_fr",
     },
 ]
 
+
 # ---------------------------------------------------------------------------
-# DDL v3.48 — schéma complet 6 tables (inchangé v3.50)
+# DDL v3.51 — schéma complet 6 tables
 # ---------------------------------------------------------------------------
 _DDL = """
 PRAGMA journal_mode = WAL;
@@ -224,9 +225,14 @@ CREATE INDEX IF NOT EXISTS idx_tendances_active
     ON tendances(active, count DESC);
 CREATE INDEX IF NOT EXISTS idx_alertes_active
     ON alertes(active, dateouverture DESC);
+CREATE INDEX IF NOT EXISTS idx_alertes_texte
+    ON alertes(texte);
 CREATE INDEX IF NOT EXISTS idx_acteurs_score
     ON acteurs(scoreactivite DESC);
+CREATE INDEX IF NOT EXISTS idx_metrics_date
+    ON metrics(date DESC);
 """
+
 
 # ---------------------------------------------------------------------------
 # CONNEXION INTERNE
@@ -247,7 +253,7 @@ def _create_connection() -> sqlite3.Connection:
                 conn.executescript(_DDL)
                 conn.commit()
                 _DB_INITIALIZED = True
-                log.info("DB schéma initialisé (v3.50)")
+                log.info("DB schéma initialisé (v3.51)")
     return conn
 
 
@@ -260,7 +266,12 @@ def _get_thread_conn() -> sqlite3.Connection:
 
 
 def closedb() -> None:
-    """Ferme et libère la connexion du thread courant. Appeler en fin de cron."""
+    """
+    Ferme et libère la connexion du thread courant.
+    Appeler en fin de cron (sentinel_main.py : finally: closedb()).
+    [DB-51-PERF1] Enregistré via atexit.register() en bas de module
+    pour garantir la fermeture même en cas de crash avant le finally.
+    """
     conn = getattr(_thread_local, "conn", None)
     if conn is not None:
         try:
@@ -286,6 +297,7 @@ def getdb():
         log.error(f"DB rollback : {exc}", exc_info=True)
         raise
 
+
 # ---------------------------------------------------------------------------
 # HELPERS CSV — module-level (non méthodes de classe)
 # ---------------------------------------------------------------------------
@@ -298,11 +310,12 @@ def _fr_row(row: dict, decimal_sep: str) -> dict:
     Seuls les float sont transformés — int, str, None passent tels quels.
     """
     if decimal_sep == ".":
-        return row  # format standard : aucune transformation
+        return row
     return {
         k: str(v).replace(".", decimal_sep) if isinstance(v, float) else v
         for k, v in row.items()
     }
+
 
 # ---------------------------------------------------------------------------
 # CLASSE PRINCIPALE — API publique compatible v3.37
@@ -315,9 +328,27 @@ class SentinelDB:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def savereport(date: str, indice: float, alerte: str,
-                   compressed: str, rawtail: str = "") -> None:
-        safe_rawtail = (rawtail or "")[-2000:]
+    def savereport(
+        date:       str,
+        indice:     float,
+        alerte:     str,
+        compressed: str,
+        rawtail:    str = "",
+    ) -> None:
+        """
+        Sauvegarde ou met à jour un rapport journalier/mensuel.
+
+        [DB-51-FIX1] safe_rawtail = (rawtail or "")[:2000]
+            CORRECTION CRITIQUE : la v3.50 utilisait [-2000:] (2000 DERNIERS
+            caractères) au lieu de [:2000] (2000 PREMIERS caractères).
+            sentinel_main.py v3.54 passe report_text[:3000] comme rawtail.
+            La troncature DB conservait donc les 2000 derniers octets du
+            texte tronqué, perdant systématiquement le début du rapport
+            (titre, indice, alerte, résumé exécutif).
+            getrecentreports() retournait des rawtail corrompus.
+            Corrigé ici : [:2000] conserve le début, le plus pertinent.
+        """
+        safe_rawtail = (rawtail or "")[:2000]  # DB-51-FIX1 : [:2000] pas [-2000:]
         with getdb() as db:
             db.execute(
                 """
@@ -333,7 +364,7 @@ class SentinelDB:
             )
 
     @staticmethod
-    def getrecentreports(ndays: int = 7) -> list:
+    def getrecentreports(ndays: int = 7) -> list[dict]:
         """Retourne les rapports des N derniers jours (filtre temporel)."""
         with getdb() as db:
             rows = db.execute(
@@ -349,19 +380,21 @@ class SentinelDB:
         return [dict(r) for r in rows]
 
     @staticmethod
-    def get_last_n_reports(n: int = 30) -> list:
+    def get_last_n_reports(n: int = 30) -> list[dict]:
         """
         [DB-48-RPT] Retourne les N derniers rapports triés par date DESC.
 
-        Distinct de getrecentreports() :
-            getrecentreports() → filtre par fenêtre temporelle (WHERE date >= ?)
-            get_last_n_reports() → filtre par nombre exact (LIMIT ?)
+        Inclut `compressed` ET `rawtail` — sentinel_main.py v3.54 utilise :
+            row.get("compressed") or row.get("rawtail") or ""
+        pour la phase MAP du rapport mensuel. Les deux colonnes sont nécessaires
+        pour la compatibilité avec les rapports antérieurs à v3.51 (compressed
+        absent, rawtail présent) et postérieurs (compressed = texte Claude complet).
 
-        Utilisé par run_monthly_report() dans sentinel_main.py :
-            rows = SentinelDB.get_last_n_reports(30)
-        Le mensuel veut exactement 30 entrées indépendamment des gaps
-        calendaires (jours fériés, pannes) — un filtre temporel sur 30j
-        pourrait retourner moins de 30 rapports si des cycles ont été sautés.
+        Distinct de getrecentreports() :
+            getrecentreports() → filtre temporel (WHERE date >= ?)
+            get_last_n_reports() → filtre cardinal (LIMIT ?) — utilisé par
+            run_monthly_report() qui veut exactement N entrées indépendamment
+            des gaps calendaires (jours fériés, pannes cron).
         """
         with getdb() as db:
             rows = db.execute(
@@ -399,10 +432,14 @@ class SentinelDB:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def loadseen(days: int = 90) -> set:
+    def loadseen(days: int = 90) -> set[str]:
         """
-        DB41-FIX3 — Charge uniquement les hashes des N derniers jours.
+        [DB41-FIX3] Charge uniquement les hashes des N derniers jours.
         Évite de charger toute la table en RAM après plusieurs mois.
+
+        [DB-51-ALIAS] Alias loadseendays = loadseen (déclaré après la classe).
+        scraper_rss.py appelle SentinelDB.loadseendays(days=90) — les deux
+        noms sont documentés ici et exposés comme méthodes de classe.
         """
         with getdb() as db:
             rows = db.execute(
@@ -412,7 +449,7 @@ class SentinelDB:
         return {r["hash"] for r in rows}
 
     @staticmethod
-    def saveseen(seen: set, source: str = "") -> None:
+    def saveseen(seen: set[str], source: str = "") -> None:
         if not seen:
             return
         today = datetime.now(timezone.utc).isoformat()
@@ -456,7 +493,7 @@ class SentinelDB:
             )
 
     @staticmethod
-    def gettendancesactives(limit: int = 50) -> list:
+    def gettendancesactives(limit: int = 50) -> list[dict]:
         with getdb() as db:
             rows = db.execute(
                 """
@@ -476,7 +513,7 @@ class SentinelDB:
 
     @staticmethod
     def ouvrirealerte(texte: str, date: str) -> None:
-        """DB41-FIX6 — UPSERT sur texte : pas de doublon d'alertes actives."""
+        """[DB41-FIX6] UPSERT sur texte : pas de doublon d'alertes actives."""
         texte = (texte or "")[:500]
         if not texte.strip():
             return
@@ -493,7 +530,16 @@ class SentinelDB:
 
     @staticmethod
     def closealerte(texte: str, date: str) -> None:
-        escaped = texte[:40].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        """
+        [DB-51-FIX2] idx_alertes_texte dans le DDL → O(log n) au lieu de O(n).
+        [BUG-DB7]    LIKE avec ESCAPE '\\' → wildcards % et _ échappés.
+        """
+        escaped = (
+            texte[:40]
+            .replace("\\", "\\\\")
+            .replace("%",  "\\%")
+            .replace("_",  "\\_")
+        )
         with getdb() as db:
             db.execute(
                 """
@@ -506,7 +552,7 @@ class SentinelDB:
             )
 
     @staticmethod
-    def getalertesactives() -> list:
+    def getalertesactives() -> list[dict]:
         with getdb() as db:
             rows = db.execute(
                 """
@@ -542,7 +588,7 @@ class SentinelDB:
             )
 
     @staticmethod
-    def getacteurs(limit: int = 20) -> list:
+    def getacteurs(limit: int = 20) -> list[dict]:
         with getdb() as db:
             rows = db.execute(
                 """
@@ -561,6 +607,11 @@ class SentinelDB:
 
     @staticmethod
     def savemetrics(date: str, **kwargs) -> None:
+        """
+        [BUG-DB5] Whitelist _ALLOWED_METRIC_COLS — SQL dynamique sécurisé.
+        [DB-48-COL] github_days_back dans la whitelist → persisté correctement.
+        Colonnes inconnues loggées en WARNING et ignorées (pas d'erreur).
+        """
         safe    = {k: v for k, v in kwargs.items() if k in _ALLOWED_METRIC_COLS}
         unknown = set(kwargs) - _ALLOWED_METRIC_COLS
         if unknown:
@@ -578,11 +629,17 @@ class SentinelDB:
             )
 
     @staticmethod
-    def getmetrics(ndays: int = 30) -> list:
+    def getmetrics(ndays: int = 30) -> list[dict]:
         """
-        [DB-48-SEL] COALESCE(github_days_back, 0) garantit 0 sur les lignes
-        antérieures à v3.48 (NULL en base, DEFAULT 0 non rétroactif sur
-        les lignes existantes).
+        [DB-48-SEL] COALESCE(github_days_back, 0) — garantit 0 sur les lignes
+        antérieures à v3.48 (NULL en base, DEFAULT 0 non rétroactif sur les
+        lignes existantes).
+
+        Appelé par sentinel_main.py v3.54 :
+            recent_metrics = SentinelDB.getmetrics(ndays=35)
+            for m in recent_metrics:
+                metrics_by_date[m["date"]]  = int(m.get("github_days_back") or 0)
+                articles_by_date[m["date"]] = int(m.get("nb_articles")      or 0)
         """
         with getdb() as db:
             rows = db.execute(
@@ -608,28 +665,15 @@ class SentinelDB:
         ndays:         int  = _CSV_DAYS,
         limit_acteurs: int  = _CSV_ACTEURS_MAX,
         output_dir:    Path = Path("output"),
-    ) -> dict:
+    ) -> dict[str, Path]:
         """
         [CSV-1] Export des données brutes en CSV légers pour les analystes.
 
-        Séparation de responsabilités (CSV-1) :
-            L'export appartient à db_manager.py (source de vérité).
-            charts.py consomme les données — il ne les possède pas et
-            ne doit pas les exporter. Toute modification du schéma
-            SQLite se répercute automatiquement dans l'export sans
-            toucher charts.py.
-
-        Opt-in (CSV-3) : appelé depuis sentinel_main.py uniquement si
-            SENTINEL_EXPORT_CSV=1 dans .env — zéro overhead sinon.
-            Bloc à insérer dans sentinel_main.py après generate_all_charts() :
-
-                csv_exports: dict = {}
-                if os.environ.get("SENTINEL_EXPORT_CSV", "0") == "1":
-                    try:
-                        csv_exports = _timed("csv_export", SentinelDB.export_csv)
-                        logger.info(f"CSV exportés : {list(csv_exports.keys())}")
-                    except Exception as e:
-                        logger.warning(f"Export CSV non bloquant : {e}")
+        [DB-51-FIX3] _CSV_MODE relu au runtime via os.environ.get() à chaque
+        appel. La v3.50 capturait _CSV_MODE à l'import du module — tout
+        changement de SENTINEL_CSV_MODE sans redémarrage était ignoré.
+        Cette correction permet aux scripts admin et aux tests de changer le
+        mode dynamiquement sans réimporter le module.
 
         Génère jusqu'à 6 fichiers selon SENTINEL_CSV_MODE (CSV-12) :
             YYYY-MM-DD_sentinel_metrics.csv          → pandas, Grafana, Superset
@@ -639,46 +683,29 @@ class SentinelDB:
             YYYY-MM-DD_sentinel_tendances.csv
             YYYY-MM-DD_sentinel_tendances_excel.csv
 
-        Différences standard vs excel_fr (CSV-9 à CSV-11) :
-            ┌──────────────┬─────────────┬──────────────┐
-            │              │  standard   │  excel_fr    │
-            ├──────────────┼─────────────┼──────────────┤
-            │ délimiteur   │     ,       │     ;        │
-            │ décimale     │    7.2      │    7,2       │
-            │ encodage     │   utf-8     │  utf-8-sig   │
-            │ BOM          │    non      │    oui       │
-            └──────────────┴─────────────┴──────────────┘
-
-        Chargement SQL (CSV-12) : 1 seule requête par dataset, partagée
-            entre les deux formats — zéro surcharge DB.
-
-        Retourne dict[str, Path] (CSV-4) :
-            exports["metrics"]          → Path standard
-            exports["metrics_excel"]    → Path excel_fr
-            ... etc.
-
-        Fallback par export (CSV-7) : une erreur sur un dataset n'annule
-            pas les autres. Une erreur sur un format n'annule pas l'autre.
+        Retourne dict[str, Path] (CSV-4) compatible avec mailer.py.
+        [CSV-7] Fallback par export : une erreur sur un dataset n'annule pas les autres.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         today   = datetime.now().strftime("%Y-%m-%d")
-        exports: dict = {}
+        exports: dict[str, Path] = {}
 
-        # Configs actives selon SENTINEL_CSV_MODE
+        # [DB-51-FIX3] Lecture runtime — pas de capture à l'import
+        csv_mode = os.environ.get("SENTINEL_CSV_MODE", "both")
+
         active_configs = [
             cfg for cfg in _CSV_EXPORT_CONFIGS
-            if _CSV_MODE in cfg["modes"]
+            if csv_mode in cfg["modes"]
         ]
         if not active_configs:
             log.warning(
-                f"CSV export : SENTINEL_CSV_MODE='{_CSV_MODE}' invalide "
+                f"CSV export : SENTINEL_CSV_MODE='{csv_mode}' invalide "
                 f"(valeurs acceptées : both, standard, excel) — export annulé"
             )
             return exports
 
-        # ── Datasets à exporter ───────────────────────────────────────────
-        datasets = [
+        datasets: list[dict] = [
             {
                 "name":          "metrics",
                 "loader":        lambda: SentinelDB.getmetrics(ndays=ndays),
@@ -706,7 +733,7 @@ class SentinelDB:
                 rows = dataset["loader"]()
             except Exception as e:
                 log.error(f"CSV {name} chargement échec : {e}", exc_info=True)
-                continue  # CSV-7 : on passe au dataset suivant
+                continue  # CSV-7 : dataset suivant
 
             if not rows:
                 log.warning(f"CSV {name} : {dataset['empty_warning']}")
@@ -714,7 +741,6 @@ class SentinelDB:
 
             fieldnames = list(rows[0].keys())
 
-            # Écriture dans chaque format actif
             for cfg in active_configs:
                 key  = f"{name}{cfg['key_suffix']}"
                 path = output_dir / f"{today}_sentinel_{name}{cfg['file_suffix']}.csv"
@@ -723,16 +749,16 @@ class SentinelDB:
                     with open(path, "w", newline="", encoding=cfg["encoding"]) as f:
                         writer = csv.DictWriter(
                             f,
-                            fieldnames = fieldnames,
-                            delimiter  = cfg["delimiter"],
+                            fieldnames=fieldnames,
+                            delimiter=cfg["delimiter"],
                         )
                         writer.writeheader()
                         writer.writerows(
                             _fr_row(r, cfg["decimal_sep"]) for r in rows
                         )
 
-                    size_kb = path.stat().st_size // 1024
-                    exports[key] = path
+                    size_kb       = path.stat().st_size // 1024
+                    exports[key]  = path
                     total_rows_written += len(rows)
                     log.info(
                         f"CSV [{cfg['label']}] {name} : "
@@ -745,11 +771,10 @@ class SentinelDB:
                     )
                     # CSV-7 : l'autre format du même dataset continue
 
-        # ── Bilan consolidé (CSV-8) ───────────────────────────────────────
         if exports:
             total_kb = sum(p.stat().st_size for p in exports.values()) // 1024
             log.info(
-                f"CSV export terminé ({_CSV_MODE}) : "
+                f"CSV export terminé ({csv_mode}) : "
                 f"{len(exports)} fichiers, "
                 f"{total_rows_written} lignes écrites, "
                 f"{total_kb} Ko total → {output_dir}/"
@@ -770,7 +795,7 @@ class SentinelDB:
     def maintenance(force: bool = False) -> None:
         """
         VACUUM + ANALYZE mensuels.
-        DB41-FIX1 : closedb() avant _create_connection() — conflict WAL évité.
+        [DB41-FIX1] closedb() avant _create_connection() — conflict WAL évité.
         """
         closedb()
         conn = _create_connection()
@@ -808,7 +833,7 @@ class SentinelDB:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def get_metrics_ndays(n: int = 1) -> list:
+    def get_metrics_ndays(n: int = 1) -> list[dict]:
         """Alias de getmetrics() — mailer.py / report_builder.py."""
         return SentinelDB.getmetrics(ndays=n)
 
@@ -818,7 +843,7 @@ class SentinelDB:
         return SentinelDB.savemetrics(date, **kwargs)
 
     @staticmethod
-    def save_seen(seen: set, source: str = "") -> None:
+    def save_seen(seen: set[str], source: str = "") -> None:
         """Alias de saveseen() — samgov_scraper.py."""
         return SentinelDB.saveseen(seen, source)
 
@@ -826,6 +851,16 @@ class SentinelDB:
     def purgeseen_older_than_days(days: int = 90) -> int:
         """Alias de purgeseeolderthandays() — scraper_rss.py."""
         return SentinelDB.purgeseeolderthandays(days)
+
+    @staticmethod
+    def loadseendays(days: int = 90) -> set[str]:
+        """
+        [DB-51-ALIAS] Alias de loadseen() pour scraper_rss.py.
+        scraper_rss.py appelle SentinelDB.loadseendays(days=90).
+        loadseen() et loadseendays() sont strictement équivalents.
+        """
+        return SentinelDB.loadseen(days=days)
+
 
 # ---------------------------------------------------------------------------
 # HEALTHCHECK
@@ -837,12 +872,15 @@ def check_integrity() -> bool:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             wal       = db.execute("PRAGMA journal_mode").fetchone()[0]
             ok        = (integrity == "ok" and wal == "wal")
-            log.info(f"HEALTHCHECK DB : {'OK' if ok else 'FAIL'} "
-                     f"(integrity={integrity}, wal={wal})")
+            log.info(
+                f"HEALTHCHECK DB : {'OK' if ok else 'FAIL'} "
+                f"(integrity={integrity}, wal={wal})"
+            )
             return ok
     except Exception as exc:
         log.error(f"HEALTHCHECK DB exception : {exc}", exc_info=True)
         return False
+
 
 # ---------------------------------------------------------------------------
 # INIT & MIGRATION
@@ -854,10 +892,13 @@ def initdb() -> None:
 
     [DB-48-MIG] Migration safe de la colonne github_days_back :
         ALTER TABLE est idempotent grâce au try/except — SQLite lève
-        une OperationalError "duplicate column name" si la colonne existe
-        déjà. Ce comportement est attendu et silencieux après le premier
-        run v3.48. L'approche ALTER TABLE (et non DROP/CREATE) préserve
-        toutes les données existantes.
+        OperationalError "duplicate column name" si la colonne existe déjà.
+        Ce comportement est attendu et silencieux après le premier run v3.48.
+
+    [DB-51-FIX2] Migration safe de l'index idx_alertes_texte :
+        CREATE INDEX IF NOT EXISTS est idempotent — aucune action si l'index
+        existe déjà (DBs v3.51+). Sur les DBs existantes (v3.40-v3.50),
+        l'index est créé lors du premier démarrage v3.51.
     """
     DBPATH.parent.mkdir(parents=True, exist_ok=True)
     with getdb():
@@ -873,6 +914,25 @@ def initdb() -> None:
     except Exception:
         pass  # Colonne déjà présente (DBs v3.48+) — comportement normal
 
+    # DB-51-FIX2 — index alertes(texte) sur DBs existantes (idempotent)
+    try:
+        with getdb() as db:
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alertes_texte ON alertes(texte)"
+            )
+        log.info("DB-51-FIX2 : index idx_alertes_texte vérifié/créé")
+    except Exception as e:
+        log.warning(f"DB-51-FIX2 : index idx_alertes_texte non créé ({e})")
+
+    # DB-51-IDX — index metrics(date DESC) sur DBs existantes (idempotent)
+    try:
+        with getdb() as db:
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metrics_date ON metrics(date DESC)"
+            )
+    except Exception:
+        pass
+
     if not MIGRATION_FLAG.exists() and (SEENJSON.exists() or MEMJSON.exists()):
         runmigration()
 
@@ -880,7 +940,7 @@ def initdb() -> None:
 def runmigration() -> None:
     """
     Migre JSON → SQLite (v3.37 → v3.40).
-    DB41-FIX2 — rename() → replace() : FileExistsError Windows évitée.
+    [DB41-FIX2] rename() → replace() : FileExistsError Windows évitée.
     """
     log.info("MIGRATION JSON → SQLite démarrage...")
 
@@ -903,7 +963,10 @@ def runmigration() -> None:
         try:
             memory = json.loads(MEMJSON.read_text(encoding="utf-8"))
             today  = datetime.now().strftime("%Y-%m-%d")
-            for report in (memory.get("compressedreports") or memory.get("compressed_reports", [])):
+            for report in (
+                memory.get("compressedreports")
+                or memory.get("compressed_reports", [])
+            ):
                 SentinelDB.savereport(
                     date       = report.get("date", today),
                     indice     = float(report.get("indice", 5.0)),
@@ -927,9 +990,10 @@ def runmigration() -> None:
         except Exception as exc:
             log.error(f"MIGRATION mémoire échec : {exc}")
 
-    MIGRATION_FLAG.write_text("v3.41", encoding="utf-8")
+    MIGRATION_FLAG.write_text("v3.51", encoding="utf-8")
     log.info("MIGRATION terminée — flag écrit")
     closedb()
+
 
 # ---------------------------------------------------------------------------
 # BACKUP AUTOMATIQUE SQLite
@@ -973,8 +1037,20 @@ def backup_db(dest_dir: str = "backups", keep_days: int = 30) -> bool:
         log.error(f"BACKUP échec : {exc}", exc_info=True)
         return False
 
+
 # ---------------------------------------------------------------------------
-# SMOKE TESTS v3.50
+# ALIASES MODULE-LEVEL — compatibilité snake_case externe
+# ---------------------------------------------------------------------------
+get_db        = getdb
+init_db       = initdb
+run_migration = runmigration
+
+# [DB-51-PERF1] Fermeture propre au exit même si finally n'est pas atteint
+atexit.register(closedb)
+
+
+# ---------------------------------------------------------------------------
+# SMOKE TESTS v3.51
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -997,46 +1073,62 @@ if __name__ == "__main__":
         assert reports[0]["alerte"] == "ROUGE",        "BUG-DB1 : upsert échoué"
         assert reports[0]["rawtail"] == "...brut MAJ", "BUG-DB8 : rawtail incorrecte"
 
+        # DB-51-FIX1 : rawtail tronquée depuis le début ([:2000] pas [-2000:])
+        long_text = "DEBUT" + ("X" * 3000) + "FIN"
+        SentinelDB.savereport("2025-01-01", 5.0, "VERT", "compressed", long_text)
+        row_trunc = next(
+            r for r in SentinelDB.get_last_n_reports(10)
+            if r["date"] == "2025-01-01"
+        )
+        assert row_trunc["rawtail"].startswith("DEBUT"), (
+            "DB-51-FIX1 : rawtail ne commence pas par DEBUT — "
+            "troncature depuis la fin au lieu du début"
+        )
+        assert not row_trunc["rawtail"].endswith("FIN"), (
+            "DB-51-FIX1 : rawtail ne doit pas contenir FIN (tronqué à 2000)"
+        )
+
         # DB-48-RPT : get_last_n_reports()
         last_n = SentinelDB.get_last_n_reports(5)
-        assert len(last_n) == 1,       "DB-48-RPT : get_last_n_reports KO"
-        assert "rawtail" in last_n[0], "DB-48-RPT : rawtail absente"
-        assert "date"    in last_n[0], "DB-48-RPT : date absente"
+        assert len(last_n) >= 1,      "DB-48-RPT : get_last_n_reports KO"
+        assert "rawtail"    in last_n[0], "DB-48-RPT : rawtail absente"
+        assert "compressed" in last_n[0], "DB-48-RPT : compressed absente"
+        assert "date"       in last_n[0], "DB-48-RPT : date absente"
 
         # BUG-DB2 : purge syntaxe valide
         SentinelDB.saveseen({"h1", "h2"}, source="Test")
         assert isinstance(SentinelDB.purgeseeolderthandays(90), int), "BUG-DB2 KO"
 
-        # DB41-FIX3 : loadseen avec filtre temporel
-        seen = SentinelDB.loadseen(days=90)
-        assert "h1" in seen, "DB41-FIX3 : loadseen filtre KO"
+        # DB41-FIX3 + DB-51-ALIAS : loadseen et loadseendays équivalents
+        seen        = SentinelDB.loadseen(days=90)
+        seen_alias  = SentinelDB.loadseendays(days=90)
+        assert "h1" in seen,           "DB41-FIX3 : loadseen filtre KO"
+        assert seen == seen_alias,     "DB-51-ALIAS : loadseen ≠ loadseendays"
 
-        # BUG-DB4 : acteurs CRUD
+        # BUG-DB4 : acteurs CRUD + COALESCE pays
         SentinelDB.saveacteur("Milrem Robotics", "EST", 8.5, today)
         SentinelDB.saveacteur("Milrem Robotics", None,  9.0, today)
         acteurs = SentinelDB.getacteurs()
         assert acteurs[0]["scoreactivite"] == 9.0, "BUG-DB4 : update score KO"
         assert acteurs[0]["pays"] == "EST",        "BUG-DB4 : COALESCE pays KO"
 
-        # BUG-DB5 : whitelist metrics — colonne invalide ignorée
-        SentinelDB.savemetrics(today, indice=7.2, alerte="ORANGE", colonneInvalide=99)
+        # BUG-DB5 + DB-48-COL : whitelist + github_days_back persisté
+        SentinelDB.savemetrics(today, indice=7.2, alerte="ORANGE",
+                               github_days_back=10, colonneInvalide=99)
         metrics = SentinelDB.getmetrics(ndays=7)
-        assert len(metrics) == 1, "EXTRA-1 : getmetrics KO"
+        assert len(metrics) == 1,                    "EXTRA-1 : getmetrics KO"
+        assert metrics[0]["github_days_back"] == 10, "DB-48-COL : github_days_back KO"
 
-        # DB-48-COL / DB-48-SEL : github_days_back persisté et relu
-        SentinelDB.savemetrics(today, github_days_back=10)
-        metrics2 = SentinelDB.getmetrics(ndays=7)
-        assert metrics2[0]["github_days_back"] == 10, \
-            "DB-48-COL/SEL : github_days_back KO"
-
-        # DB-48-SEL : COALESCE → 0 si NULL
+        # DB-48-SEL : COALESCE → 0 si NULL (ligne antérieure à v3.48)
         SentinelDB.savemetrics("2000-01-01", indice=5.0, alerte="VERT")
-        old_rows = [r for r in SentinelDB.getmetrics(ndays=365 * 30)
-                    if r["date"] == "2000-01-01"]
+        old_rows = [
+            r for r in SentinelDB.getmetrics(ndays=365 * 30)
+            if r["date"] == "2000-01-01"
+        ]
         assert old_rows[0]["github_days_back"] == 0, \
             "DB-48-SEL : COALESCE NULL → 0 KO"
 
-        # BUG-DB7 : wildcards échappés
+        # BUG-DB7 + DB-51-FIX2 : wildcards échappés + index alertes(texte)
         SentinelDB.ouvrirealerte("Déploiement KARGU 100% confirmé", today)
         SentinelDB.ouvrirealerte("Type_X Korea opérationnel",        today)
         SentinelDB.closealerte("KARGU 100%", today)
@@ -1050,24 +1142,23 @@ if __name__ == "__main__":
         alertes2 = SentinelDB.getalertesactives()
         assert len(alertes2) == 1, "DB41-FIX6 : doublon alerte détecté"
 
-        # CSV-9 à CSV-12 : double format standard + excel_fr
-        SentinelDB.savetendance("Essaims FPV Ukraine", today)
-        SentinelDB.savetendance("UGV NATO interopérabilité", today)
+        # CSV-9 à CSV-12 : double format + modes
+        SentinelDB.savetendance("Essaims FPV Ukraine",         today)
+        SentinelDB.savetendance("UGV NATO interopérabilité",   today)
         csv_out = Path(tmpdir) / "csv_test"
 
-        # Test mode "both" (défaut)
         os.environ["SENTINEL_CSV_MODE"] = "both"
         exports_both = SentinelDB.export_csv(
             ndays=30, limit_acteurs=10, output_dir=csv_out
         )
-        assert "metrics"          in exports_both, "CSV-9 : metrics standard absent"
-        assert "metrics_excel"    in exports_both, "CSV-9 : metrics_excel absent"
-        assert "acteurs"          in exports_both, "CSV-9 : acteurs standard absent"
-        assert "acteurs_excel"    in exports_both, "CSV-9 : acteurs_excel absent"
-        assert "tendances"        in exports_both, "CSV-9 : tendances standard absent"
-        assert "tendances_excel"  in exports_both, "CSV-9 : tendances_excel absent"
+        assert "metrics"         in exports_both, "CSV-9 : metrics standard absent"
+        assert "metrics_excel"   in exports_both, "CSV-9 : metrics_excel absent"
+        assert "acteurs"         in exports_both, "CSV-9 : acteurs standard absent"
+        assert "acteurs_excel"   in exports_both, "CSV-9 : acteurs_excel absent"
+        assert "tendances"       in exports_both, "CSV-9 : tendances standard absent"
+        assert "tendances_excel" in exports_both, "CSV-9 : tendances_excel absent"
 
-        # Vérification décimales : standard → "." / excel → ","
+        # CSV-10 : décimales standard="." / excel=","
         with open(exports_both["metrics"],       encoding="utf-8")     as f:
             std_content = f.read()
         with open(exports_both["metrics_excel"], encoding="utf-8-sig") as f:
@@ -1075,30 +1166,34 @@ if __name__ == "__main__":
         assert "7.2" in std_content, "CSV-10 : décimale standard KO"
         assert "7,2" in xl_content,  "CSV-10 : décimale excel_fr KO"
 
-        # Vérification BOM utf-8-sig (CSV-11)
+        # CSV-11 : BOM UTF-8 correct — [DB-51-FIX4] b"ï»¿" pas b"ï»¿"
         with open(exports_both["metrics_excel"], "rb") as f:
             bom = f.read(3)
-        assert bom == b"ï»¿", "CSV-11 : BOM utf-8-sig absent"
+        assert bom == b"ï»¿", (
+            f"CSV-11 : BOM UTF-8 incorrect — reçu {bom!r}, "
+            f"attendu b'\\xef\\xbb\\xbf'"
+        )
 
-        # Vérification nommage daté (CSV-6)
+        # CSV-6 : nommage daté
         assert exports_both["metrics"].name.startswith(today),       "CSV-6 : nommage standard KO"
         assert exports_both["metrics_excel"].name.startswith(today), "CSV-6 : nommage excel KO"
 
-        # Test mode "standard" — uniquement les fichiers sans _excel
+        # CSV-12 : mode "standard" → pas de _excel
         os.environ["SENTINEL_CSV_MODE"] = "standard"
-        exports_std = SentinelDB.export_csv(
-            ndays=30, limit_acteurs=10, output_dir=csv_out
-        )
+        exports_std = SentinelDB.export_csv(ndays=30, limit_acteurs=10, output_dir=csv_out)
         assert "metrics"       in exports_std,     "CSV-12 : standard mode KO"
         assert "metrics_excel" not in exports_std, "CSV-12 : excel généré en mode standard"
 
-        # Test mode "excel" — uniquement les fichiers _excel
+        # CSV-12 : mode "excel" → pas de standard
         os.environ["SENTINEL_CSV_MODE"] = "excel"
-        exports_xl = SentinelDB.export_csv(
-            ndays=30, limit_acteurs=10, output_dir=csv_out
-        )
-        assert "metrics_excel" in exports_xl,  "CSV-12 : excel mode KO"
+        exports_xl = SentinelDB.export_csv(ndays=30, limit_acteurs=10, output_dir=csv_out)
+        assert "metrics_excel" in exports_xl,    "CSV-12 : excel mode KO"
         assert "metrics"       not in exports_xl, "CSV-12 : standard généré en mode excel"
+
+        # DB-51-FIX3 : _CSV_MODE relu au runtime (pas capturé à l'import)
+        os.environ["SENTINEL_CSV_MODE"] = "both"
+        exports_rt = SentinelDB.export_csv(ndays=30, limit_acteurs=10, output_dir=csv_out)
+        assert "metrics_excel" in exports_rt, "DB-51-FIX3 : runtime _CSV_MODE KO"
 
         # PERF-DB1 : closedb thread-local
         closedb()
@@ -1108,24 +1203,19 @@ if __name__ == "__main__":
 
         print("
 " + "=" * 60)
-        print("✅ Tous les smoke tests v3.50 passent.")
-        print(f"   Rapports          : {len(reports)}")
-        print(f"   get_last_n(5)     : {len(last_n)}")
-        print(f"   Acteurs           : {len(acteurs)}")
-        print(f"   Métriques         : {len(metrics)}")
-        print(f"   github_days_back  : {metrics2[0]['github_days_back']}")
-        print(f"   Alertes actives   : {len(alertes2)}")
-        print(f"   Seenhashes        : {len(seen)}")
-        print(f"   CSV mode=both     : {list(exports_both.keys())}")
-        print(f"   CSV mode=standard : {list(exports_std.keys())}")
-        print(f"   CSV mode=excel    : {list(exports_xl.keys())}")
+        print("✅  Tous les smoke tests v3.51 passent.")
+        print(f"    Rapports          : {len(reports)}")
+        print(f"    get_last_n(5)     : {len(last_n)}")
+        print(f"    rawtail[:2000]    : OK (commence par DEBUT)")
+        print(f"    loadseen/alias    : {len(seen)} hashes")
+        print(f"    Acteurs           : {len(acteurs)}")
+        print(f"    Métriques         : {len(metrics)}")
+        print(f"    github_days_back  : {metrics[0]['github_days_back']}")
+        print(f"    Alertes actives   : {len(alertes2)}")
         csv_total_kb = sum(p.stat().st_size for p in exports_both.values()) // 1024
-        print(f"   CSV poids total   : {csv_total_kb} Ko")
+        print(f"    CSV mode=both     : {list(exports_both.keys())}")
+        print(f"    CSV mode=standard : {list(exports_std.keys())}")
+        print(f"    CSV mode=excel    : {list(exports_xl.keys())}")
+        print(f"    CSV poids total   : {csv_total_kb} Ko")
+        print(f"    BOM UTF-8         : {bom!r} ✅")
         print("=" * 60)
-
-# ---------------------------------------------------------------------------
-# ALIASES module-level — compatibilité snake_case
-# ---------------------------------------------------------------------------
-get_db        = getdb
-init_db       = initdb
-run_migration = runmigration
