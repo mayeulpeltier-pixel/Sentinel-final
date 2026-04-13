@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# init_prompts.py — SENTINEL v3.42 — Initialisation des prompts et structure projet
+# init_prompts.py — SENTINEL v3.54 — Initialisation des prompts et structure projet
 # ─────────────────────────────────────────────────────────────────────────────
 # Corrections v3.40 (originales) :
 #   E2-FIX CDC-C    CHANGELOG.md créé automatiquement
@@ -27,7 +27,45 @@
 # Corrections v3.42 :
 #   IP-42-FIX1  _extract_version() + _build_scope_md() — versions lues dynamiquement
 #               depuis les scripts au lieu d'être codées en dur dans SCOPE_MD.
-#               Élimine la maintenance manuelle à chaque mise à jour de sous-script.
+#
+# Corrections v3.54 (audit complet inter-scripts) :
+#   IP-54-FIX1  BUG-C1 : INJECTION30RAPPORTSCOMPRESSES → INJECTIONMENSUELLE
+#               Alignement REQUIRED_MONTHLY_MARKERS + MONTHLY_PROMPT avec
+#               sentinel_api.py run_sentinel_monthly() qui cherche INJECTIONMENSUELLE.
+#               CRITIQUE : sans ce fix, le rapport mensuel reçoit le placeholder littéral.
+#
+#   IP-54-FIX2  BUG-C2 : ARTICLESFILTRSPARSCRAPER → ARTICLESFILTRESPARSCRAPER (avec É)
+#               Alignement REQUIRED_DAILY_MARKERS + DAILY_PROMPT avec sentinel_api.py
+#               .replace("ARTICLESFILTRESPARSCRAPER", articles_text).
+#               CRITIQUE : sans ce fix, Claude reçoit le placeholder au lieu des articles.
+#
+#   IP-54-FIX3  BUG-C6 : Suppression placeholder ANNEE — redondant avec MOIS
+#               sentinel_api.py transmet mois=strftime("%B %Y") = "April 2026"
+#               (inclut déjà l'année). ANNEE restait littéral dans le prompt Claude.
+#               Template monthly simplifié : <periode>MOIS</periode>.
+#
+#   IP-54-FIX4  BUG-M1 : Modules mensuels alignés en français avec health_check.py
+#               "EXECUTIVE SUMMARY" → "RÉSUMÉ EXÉCUTIF MENSUEL"
+#               health_check.py (POST-FIX4) valide "RÉSUMÉ EXÉCUTIF MENSUEL".
+#
+#   IP-54-FIX5  BUG-M5 : 72 → 77 flux RSS dans _SCRIPT_TABLE (aligné scraper_rss.py)
+#
+#   IP-54-FIX6  INC-4/6/3 : GITHUB_TOKEN, DEEPL_API_KEY, SENTINEL_EXPORT_CSV
+#               ajoutés dans .env.example (absents dans v3.42, silencieux en prod)
+#
+#   IP-54-FIX7  INC-11/12 : Noms de fichiers dans _SCRIPT_TABLE alignés sur les
+#               imports réels de sentinel_main.py. "healthcheck.py" → "health_check.py".
+#               github_scraper.py ajouté dans _OPTIONAL_TABLE (était absent).
+#
+#   IP-54-FIX8  _extract_version() : regex corrigée via chr(92) + pattern étendu
+#               VERSION = "X.Y".
+#               La v3.42 et le soumis initial utilisaient r'[vV](d+.d+...)' avec
+#               d et . littéraux (pas \d et \.) → retournait "?" pour TOUS les
+#               scripts → SCOPE.md entièrement inutile depuis v3.42.
+#               Correction : pattern _BS=chr(92) pour [vV]X.Y ET capture
+#               VERSION = "X.Y" (sans préfixe v) — couvre tous les formats.
+#
+#   IP-54-FIX9  CHANGELOG.md mis à jour avec toutes les corrections v3.54
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage :
 #   python init_prompts.py             Initialisation initiale (skip si déjà fait)
@@ -60,59 +98,71 @@ if FORCE_REWRITE and CHECK_ONLY:
     sys.exit(1)
 
 # ── Marqueurs obligatoires (cohérence sentinel_api.py) ────────────────────────
+#
+# RÈGLE ABSOLUE : ces marqueurs DOIVENT correspondre exactement aux chaînes
+# que sentinel_api.py recherche via .replace(...) dans les templates de prompts.
+# Toute divergence cause un échec silencieux (placeholder littéral → Claude).
+
 REQUIRED_SYSTEM_MARKERS = [
-    "TAVILYMAX",  # IP-41-FIX2 : remplacé au runtime par sentinel_api.py
+    "TAVILYMAX",                     # IP-41-FIX2 : remplacé au runtime par sentinel_api.py
 ]
+
 REQUIRED_DAILY_MARKERS = [
     "DATEAUJOURDHUI",
-    "ARTICLESFILTRSPARSCRAPER",
+    "ARTICLESFILTRESPARSCRAPER",     # IP-54-FIX2 : était ARTICLESFILTRSPARSCRAPER (sans É)
     "MEMOIRECOMPRESSE7JOURS",
     "DEBUTJSONDELTA",
     "FINJSONDELTA",
 ]
+
 REQUIRED_MONTHLY_MARKERS = [
     "MOIS",
-    "ANNEE",       # IP-41-FIX6 : était "ANNE"
-    "INJECTION30RAPPORTSCOMPRESSES",
+    "INJECTIONMENSUELLE",            # IP-54-FIX1 : était INJECTION30RAPPORTSCOMPRESSES
+    # NOTE IP-54-FIX3 : ANNEE supprimé — mois=strftime("%B %Y") inclut déjà l'année
 ]
+
+# IP-54-FIX4 : noms en français, alignés avec health_check.py (POST-FIX4)
 REQUIRED_MONTHLY_MODULES = [
-    "EXECUTIVE SUMMARY",
-    "STATISTIQUES",
+    "RÉSUMÉ EXÉCUTIF MENSUEL",
+    "STATISTIQUES AGRÉGÉES",
     "TENDANCES LOURDES",
     "RUPTURES TECHNOLOGIQUES",
     "AXES STRATÉGIQUES",
     "CARTE FINANCIÈRE",
     "POINTS D'ATTENTION",
-    "RECOMMANDATIONS",
+    "RECOMMANDATIONS STRATÉGIQUES",
 ]
 
-# ── Table des scripts du projet (IP-42-FIX1) ─────────────────────────────────
-# Chaque entrée : (chemin relatif, rôle, optionnel)
+# ── Table des scripts du projet (IP-42-FIX1 + IP-54-FIX7) ────────────────────
+# Noms de fichiers DOIVENT correspondre aux imports réels de sentinel_main.py
+# IP-54-FIX7 : "healthcheck.py" → "health_check.py" (nom réel sur disque)
+# IP-54-FIX5 : 72 → 77 flux RSS
 _SCRIPT_TABLE = [
-    ("init_prompts.py",      "Initialisation structure & prompts",  False),
-    ("scraper_rss.py",       "Collecte 72 flux RSS",                False),
-    ("memory_manager.py",    "Mémoire compressée Haiku",            False),
-    ("sentinel_api.py",      "Analyse Claude Sonnet + Tavily",      False),
-    ("charts.py",            "Graphiques PNG/Plotly",               False),
-    ("report_builder.py",    "Rapport HTML + PDF",                  False),
-    ("mailer.py",            "Envoi SMTP Gmail",                    False),
-    ("sentinel_main.py",     "Orchestrateur principal",             False),
-    ("samgov_scraper.py",    "SAM.gov DoD + TED EU + BOAMP",        False),
-    ("db_manager.py",        "SQLite WAL centralisé",               False),
-    ("healthcheck.py",       "Monitoring RSS + config",             False),
-    ("watchdog.py",          "Surveillance cron + alerte email",    False),
+    ("init_prompts.py",     "Initialisation structure & prompts",  False),
+    ("scraper_rss.py",      "Collecte 77 flux RSS",                False),
+    ("memory_manager.py",   "Mémoire compressée Haiku",            False),
+    ("sentinel_api.py",     "Analyse Claude Sonnet + Tavily",      False),
+    ("charts.py",           "Graphiques PNG/Plotly",               False),
+    ("report_builder.py",   "Rapport HTML + PDF",                  False),
+    ("mailer.py",           "Envoi SMTP Gmail",                    False),
+    ("sentinel_main.py",    "Orchestrateur principal",             False),
+    ("samgov_scraper.py",   "SAM.gov DoD + TED EU + BOAMP",        False),
+    ("db_manager.py",       "SQLite WAL centralisé",               False),
+    ("health_check.py",     "Monitoring RSS + config",             False),
+    ("watchdog.py",         "Surveillance cron + alerte email",    False),
 ]
+
 _OPTIONAL_TABLE = [
-    ("ops_patents.py",       "Brevets Espacenet OPS",   "PRIORITÉ 2"),
-    ("telegram_scraper.py",  "Telegram militaire",      "PRIORITÉ 3"),
-    ("nlp_scorer.py",        "TF-IDF bigrammes",        "PRIORITÉ 5"),
-    ("dashboard.py",         "Interface Streamlit",     "PRIORITÉ 6"),
+    ("ops_patents.py",       "Brevets Espacenet OPS + USPTO",  "PRIORITÉ 2"),
+    ("telegram_scraper.py",  "Telegram militaire",              "PRIORITÉ 3"),
+    ("github_scraper.py",    "Veille GitHub repos défense",     "PRIORITÉ 4"),
+    ("nlp_scorer.py",        "TF-IDF bigrammes",                "PRIORITÉ 5"),
+    ("dashboard.py",         "Interface Streamlit",             "PRIORITÉ 6"),
 ]
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # SYSTEM PROMPT
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 SYSTEM_PROMPT = """
 Tu es SENTINEL, un système expert d'analyse OSINT spécialisé dans la robotique
@@ -128,7 +178,7 @@ DOMAINES DE COUVERTURE
   Manta Ray DARPA, Ghost Shark, ECA Group, Exail, Saildrone Military, Seagull USV Elbit,
   Devil Ray, Razorback, Knifefish MCM, Snakehead UUV
 • Drones et munitions rôdeuses : Switchblade, Lancet, Shahed, FPV combat Ukraine,
-  Bayraktar TB2, Akıncı, Kargu STM, ZALA, Geran-2, Orlan-10, Lanius, Harpy
+  Bayraktar TB2, Akinci, Kargu STM, ZALA, Geran-2, Orlan-10, Lanius, Harpy
 • IA militaire & technologies transverses : LAWS, MUM-T, Mosaic Warfare, CCA DARPA,
   Loyal Wingman, Golden Horde, IA de ciblage, Edge AI militaire, Electronic Warfare IA
 • Acteurs industriels : Anduril, Shield AI, L3Harris, Palantir Defense, Lockheed Martin
@@ -151,26 +201,26 @@ MODULE 1 — RÉSUMÉ EXÉCUTIF
   Contexte immédiat en 3-5 lignes
 
 MODULE 2 — TABLEAU DE BORD STATISTIQUE
-  | Métrique           | Valeur |
-  | Sources analysées  | N      |
-  | Sources pertinentes| N      |
-  | Indice d'activité  | X.X/10 |
-  | Delta J-1          | ±X.X   |
-  | Niveau alerte      | COULEUR|
+  | Métrique            | Valeur  |
+  | Sources analysées   | N       |
+  | Sources pertinentes | N       |
+  | Indice d'activité   | X.X/10  |
+  | Delta J-1           | +-X.X   |
+  | Niveau alerte       | COULEUR |
   Répartition géographique % et domaines %
 
 MODULE 3 — FAITS MARQUANTS DU JOUR
   Format pour chaque fait :
   **[TITRE]** *(Source : NOM, Score : X.X, Niveau : VERT/ORANGE/ROUGE)*
   Analyse en 3-5 phrases. Implications stratégiques.
-  *(Sources croisées : N)* si crossref ≥ 2
+  *(Sources croisées : N)* si crossref >= 2
 
 MODULE 4 — ANALYSE GÉOPOLITIQUE
   Sous-sections par zone active : USA/OTAN | Europe/France | Israël |
   Turquie | Asie-Pacifique | Chine/Russie | Moyen-Orient | Inde
 
 MODULE 5 — TENSIONS & ALERTES ACTIVES
-  Format : 🔴 CRITIQUE / 🟠 MODÉRÉE / 🟡 SURVEILLANCE
+  Format : CRITIQUE / MODEREE / SURVEILLANCE
   Chaque alerte : description, source, date ouverture, évolution J-1
 
 MODULE 6 — ACTEURS INDUSTRIELS & PROGRAMMES
@@ -217,10 +267,12 @@ RÈGLES QUALITÉ
 # IP-41-FIX2 : TAVILYMAX remplacé au runtime par sentinel_api.py
 #              via os.environ.get("SENTINEL_TAVILY_MAX", "5") avant envoi à Claude.
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # PROMPT JOURNALIER
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# IP-54-FIX2 : Marqueur ARTICLESFILTRESPARSCRAPER corrigé (avec É)
+#              Correspond EXACTEMENT à sentinel_api.py :
+#              user_prompt.replace("ARTICLESFILTRESPARSCRAPER", articles_text)
 
 DAILY_PROMPT = """
 Date du rapport : DATEAUJOURDHUI
@@ -230,7 +282,7 @@ Recherche web disponible (Tavily) : OUI|NON
 ARTICLES FILTRÉS PAR LE SCRAPER (classés par score)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ARTICLESFILTRSPARSCRAPER
+ARTICLESFILTRESPARSCRAPER
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MÉMOIRE COMPRESSÉE — 7 DERNIERS JOURS
@@ -270,17 +322,24 @@ Si aucun article pertinent n'est disponible pour un module :
 écrire "Aucune information significative ce jour." plutôt que d'inventer.
 """.strip()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # PROMPT MENSUEL
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# IP-54-FIX1 : INJECTIONMENSUELLE (était INJECTION30RAPPORTSCOMPRESSES)
+#              Correspond EXACTEMENT à sentinel_api.py run_sentinel_monthly() :
+#              template.replace("MOIS", mois).replace("INJECTIONMENSUELLE", injection)
+#
+# IP-54-FIX3 : <periode>MOIS</periode> uniquement — ANNEE supprimé
+#              mois = strftime("%B %Y") = "April 2026" — l'année est déjà incluse.
+#
+# IP-54-FIX4 : MODULE 1 → "RÉSUMÉ EXÉCUTIF MENSUEL" (aligné health_check.py POST-FIX4)
 
 MONTHLY_PROMPT = """
 <task>RAPPORT MENSUEL SENTINEL</task>
-<periode>MOIS ANNEE</periode>
+<periode>MOIS</periode>
 
 <rapportsjournaliers>
-INJECTION30RAPPORTSCOMPRESSES
+INJECTIONMENSUELLE
 </rapportsjournaliers>
 
 <instructions>
@@ -288,7 +347,7 @@ Synthèse stratégique mensuelle de fond.
 
 STRUCTURE OBLIGATOIRE — 8 modules :
 
-## MODULE 1 — EXECUTIVE SUMMARY
+## MODULE 1 — RÉSUMÉ EXÉCUTIF MENSUEL
 1 page. Niveau alerte mensuel (VERT/ORANGE/ROUGE justifié).
 Top 3 tendances du mois. Top 3 alertes persistantes.
 Faits les plus significatifs sur 30 jours.
@@ -329,7 +388,7 @@ Nouveaux programmes annoncés ou financés.
 ## MODULE 7 — POINTS D'ATTENTION
 Ce qui peut basculer dans les 30-90 jours.
 Signaux d'alerte précoce identifiés.
-Échéances contractuelles ou programmatiques critiques.
+Echéances contractuelles ou programmatiques critiques.
 Zones de tension émergente.
 
 ## MODULE 8 — RECOMMANDATIONS STRATÉGIQUES
@@ -342,19 +401,21 @@ Actions recommandées pour l'analyste.
 RÈGLES :
 • Synthèse sur la base des 30 rapports journaliers compressés fournis
 • Citez les dates précises pour les faits importants
-• Distinguer tendance confirmée (≥3 occurrences) vs signal faible (1-2)
+• Distinguer tendance confirmée (>=3 occurrences) vs signal faible (1-2)
 • Toujours indiquer la source de référence pour chaque affirmation
 • Format Markdown structuré pour navigation facile
+• NOTE MÉTHODOLOGIQUE : si des blocs RATTRAPAGE GITHUB ou context_metadata
+  sont présents dans les données, les respecter intégralement — ne pas
+  surpondérer les semaines de rattrapage dans les tendances long-terme.
 </instructions>
 """.strip()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # REQUIREMENTS.TXT (R1-F2)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 REQUIREMENTS_TXT = """
-# SENTINEL v3.42 — Dépendances Python épinglées (R1-F2)
+# SENTINEL v3.54 — Dépendances Python épinglées (R1-F2)
 # Installer avec : pip install -r requirements.txt
 # Testé Python 3.10+ (walrus operator := requis)
 
@@ -363,10 +424,10 @@ anthropic>=0.25.0           # Claude Sonnet 4.6 / Haiku 4.5
 feedparser>=6.0.11          # Collecte RSS
 requests>=2.31.0            # HTTP scraping + SAM.gov + TED EU
 python-dotenv>=1.0.0        # Variables d'environnement .env
+tenacity>=8.2.0             # Retry exponentiel (samgov_scraper + api)
 
 # ── Analyse & IA ────────────────────────────────────────────
 tavily-python>=0.3.0        # Recherche web temps réel (optionnel)
-tenacity>=8.2.0             # Retry exponentiel sentinel_api.py (optionnel)
 openai>=1.0.0               # Fallback GPT-4o-mini (optionnel)
 
 # ── Visualisation ───────────────────────────────────────────
@@ -378,15 +439,14 @@ kaleido>=0.2.1              # Export PNG Plotly
 weasyprint>=60.0            # PDF depuis HTML (Linux : apt libcairo2)
 schedule>=1.2.0             # Scheduler Python (alternative cron)
 
-# ── NLP scoring (optionnel — PRIORITÉ 5 A32) ────────────────
+# ── NLP scoring (optionnel — PRIORITÉ 5) ────────────────────
 scikit-learn>=1.3.0         # TF-IDF bigrammes nlp_scorer.py
+scipy>=1.11.0               # Dépendance scikit-learn
 
-# ── Dashboard web (optionnel — PRIORITÉ 6 A25) ──────────────
+# ── Dashboard web (optionnel — PRIORITÉ 6) ──────────────────
 streamlit>=1.28.0           # Interface web locale dashboard.py
-fastapi>=0.104.0            # API REST optionnelle
-uvicorn>=0.24.0             # Serveur ASGI FastAPI
 
-# ── Telegram scraping (optionnel — PRIORITÉ 3 A20) ──────────
+# ── Telegram scraping (optionnel — PRIORITÉ 3) ──────────────
 telethon>=1.30.0            # Telegram API telegram_scraper.py
 
 # ── Système ─────────────────────────────────────────────────
@@ -395,15 +455,16 @@ telethon>=1.30.0            # Telegram API telegram_scraper.py
 # Windows : pip install weasyprint suffit (bundle GTK v60 inclus)
 """.strip()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# .ENV.EXAMPLE (NEW-IP1 / IP-41-FIX4 / IP-41-FIX5)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# .ENV.EXAMPLE (NEW-IP1 / IP-41-FIX4 / IP-41-FIX5 / IP-54-FIX6)
+# =============================================================================
+# IP-54-FIX6 : GITHUB_TOKEN, DEEPL_API_KEY, SENTINEL_EXPORT_CSV,
+#              SENTINEL_CB_RESET_H, OPENAI_FALLBACK_MODEL ajoutés
 
 ENV_EXAMPLE = """
-# SENTINEL v3.42 — Variables d'environnement
+# SENTINEL v3.54 — Variables d'environnement
 # Copier ce fichier en .env et remplir les valeurs
-# Ne jamais committer .env dans git (.gitignore obligatoire)
+# Ne JAMAIS committer .env dans git (.gitignore obligatoire)
 
 # ── Anthropic (OBLIGATOIRE) ──────────────────────────────────
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -419,7 +480,7 @@ SENTINEL_TAVILY_MAX=5
 
 # ── Email SMTP (OBLIGATOIRE pour envoi rapport) ──────────────
 # Gmail : créer un "mot de passe d'application" dans
-#         compte Google → Sécurité → Mots de passe d'applications
+#         Compte Google > Sécurité > Mots de passe d'applications
 SMTP_USER=votre.adresse@gmail.com
 SMTP_PASS=xxxx xxxx xxxx xxxx
 REPORT_EMAIL=destinataire@example.com
@@ -431,35 +492,68 @@ SMTP_PORT=587
 # ── SAM.gov (RECOMMANDÉ — gratuit sur sam.gov/developers) ────
 SAM_GOV_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 SENTINEL_MIN_CONTRACT_USD=1000000
+SENTINEL_EUR_TO_USD=1.08
+SENTINEL_MAX_CONTRACTS=50
+
+# ── GitHub scraper (RECOMMANDÉ — augmente quota 60 -> 5000 req/h)
+# Créer un token sur https://github.com/settings/tokens (lecture seule)
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GITHUB_COOLDOWN_DAYS=7
+GITHUB_DAYS_BACK=7
+GITHUB_MAX_LOOKBACK=21
+
+# ── DeepL traduction Telegram (optionnel — PRIORITÉ 3) ───────
+# Clé API gratuite sur https://www.deepl.com/pro-api (500k chars/mois)
+DEEPL_API_KEY=
+DEEPL_MAX_CHARS_MONTH=450000
 
 # ── Base de données SQLite (optionnel — défaut : data/sentinel.db)
 SENTINEL_DB=data/sentinel.db
+
+# ── Export CSV (optionnel) ────────────────────────────────────
+# 0=désactivé | 1=activé
+SENTINEL_EXPORT_CSV=0
+# both=standard+Excel FR | standard | excel
+SENTINEL_CSV_MODE=both
+
+# ── Rétention des rapports HTML (optionnel — défaut : 30 jours)
+SENTINEL_RETENTION_DAYS=30
 
 # ── Serveur de santé (optionnel — défaut : 8765) ─────────────
 SENTINEL_HEALTH_PORT=8765
 
 # ── Circuit-breaker API (optionnel) ──────────────────────────
 SENTINEL_CB_MAX=3
+SENTINEL_CB_RESET_H=2
 
-# ── Purge rapports (optionnel — défaut : 30 jours) ───────────
-SENTINEL_RETENTION_DAYS=30
+# ── Ollama fallback local (optionnel) ────────────────────────
+OLLAMA_TIMEOUT=180
 
 # ── Telegram (optionnel — PRIORITÉ 3) ────────────────────────
 TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_SESSION=data/sentinel_telegram.session
+TELEGRAM_HOURS_BACK=48
+
+# ── EPO OPS Brevets (optionnel — PRIORITÉ 2) ─────────────────
+# Inscription gratuite : https://developers.epo.org
+OPS_KEY=
+OPS_SECRET=
+OPS_DAYS_BACK=30
 
 # ── OpenAI fallback (optionnel — PRIORITÉ 4) ─────────────────
 OPENAI_API_KEY=
+OPENAI_FALLBACK_MODEL=gpt-4o-mini
 
-# ── Debug ─────────────────────────────────────────────────────
+# ── Debug & tests ─────────────────────────────────────────────
 SENTINEL_MAILER_DRYRUN=0
+SENTINEL_DRYRUN=0
+SENTINEL_HC_TIMEOUT=8
 """.strip()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CHANGELOG.MD (E2-FIX CDC-C)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHANGELOG.MD (E2-FIX CDC-C / IP-54-FIX9)
+# =============================================================================
 
 CHANGELOG_MD = """
 # CHANGELOG.md — SENTINEL — Historique des versions
@@ -469,46 +563,64 @@ Types : Ajouté | Corrigé | Modifié | Supprimé | Sécurité
 
 ---
 
+## v3.54 — 2026-04-13
+
+### Corrigé (Audit complet inter-scripts)
+- `init_prompts.py`    : IP-54-FIX1 BUG-C1 INJECTION30RAPPORTSCOMPRESSES -> INJECTIONMENSUELLE
+- `init_prompts.py`    : IP-54-FIX2 BUG-C2 ARTICLESFILTRSPARSCRAPER -> ARTICLESFILTRESPARSCRAPER
+- `init_prompts.py`    : IP-54-FIX3 BUG-C6 Suppression placeholder ANNEE (redondant avec MOIS)
+- `init_prompts.py`    : IP-54-FIX4 BUG-M1 MODULE 1 mensuel -> RÉSUMÉ EXÉCUTIF MENSUEL
+- `init_prompts.py`    : IP-54-FIX5 BUG-M5 72 -> 77 flux RSS dans _SCRIPT_TABLE
+- `init_prompts.py`    : IP-54-FIX6 INC-4/6/3 GITHUB_TOKEN, DEEPL_API_KEY, SENTINEL_EXPORT_CSV
+- `init_prompts.py`    : IP-54-FIX7 INC-11/12 noms fichiers + github_scraper.py ajouté
+- `init_prompts.py`    : IP-54-FIX8 _extract_version() regex corrigée via chr(92)
+- `db_manager.py`      : BUG-DB-1 colonne github_days_back dans DDL + ALLOWED_METRIC_COLS
+- `ops_patents.py`     : import html manquant (NameError sur html.unescape)
+- `sentinel_api.py`    : API-52-FIX1/2/3/4/5/6 circuit-breaker, lazy prompts, regex
+
+### Ajouté
+- `init_prompts.py`    : Note méthodologique RATTRAPAGE GITHUB dans MONTHLY_PROMPT
+- `.env.example`       : GITHUB_TOKEN, DEEPL_API_KEY, OPS_KEY/SECRET, SENTINEL_EXPORT_CSV
+
+---
+
 ## v3.42 — 2026-04-09
 
 ### Corrigé
-- `scraper_rss.py`    : SCR-42-FIX1 keywords TOML, SCR-42-FIX2 Jaccard adaptatif
-- `report_builder.py` : RB-42-FIX1 regex <li> re.S → re.M (fusion listes)
-- `report_builder.py` : RB-42-FIX2 nettoyage caractères invisibles Unicode
-- `report_builder.py` : RB-42-FIX3 orphans/widows CSS @media print
+- `scraper_rss.py`     : SCR-42-FIX1 keywords TOML, SCR-42-FIX2 Jaccard adaptatif
+- `report_builder.py`  : RB-42-FIX1 regex <li> re.S -> re.M (fusion listes)
+- `report_builder.py`  : RB-42-FIX2 nettoyage caractères invisibles Unicode
+- `report_builder.py`  : RB-42-FIX3 orphans/widows CSS @media print
 
 ### Ajouté
-- `init_prompts.py`   : IP-42-FIX1 _extract_version() + _build_scope_md() dynamiques
+- `init_prompts.py`    : IP-42-FIX1 _extract_version() + _build_scope_md() dynamiques
 
 ---
 
 ## v3.41 — 2026-04-09
 
 ### Corrigé
-- `sentinel_main.py`  : SONNET_MODEL transmis à run_sentinel()
-- `sentinel_main.py`  : articles.extend(tg_arts or []) — garde None
-- `sentinel_main.py`  : port SENTINEL_HEALTH_PORT protégé try/except ValueError
-- `sentinel_main.py`  : spec/loader None guard dans _load_optional_scraper()
-- `report_builder.py` : RB-41-FIX1 img_to_svg_or_b64 définie (NameError)
-- `report_builder.py` : RB-41-FIX2 signature build_html_report corrigée
-- `report_builder.py` : RB-41-FIX3/4/5/6/7/8 regex markdown_to_html corrigées
-- `report_builder.py` : RB-41-FIX9/10/11 double guard, import local, SQLite Row
-- `init_prompts.py`   : IP-41-FIX1 _write_file atomicité .env.example
-- `init_prompts.py`   : IP-41-FIX2 TAVILYMAX validé
-- `init_prompts.py`   : IP-41-FIX3 main() complétée
-- `init_prompts.py`   : IP-41-FIX4/5/6/7/8 .env.example, ANNEE, versions
+- `sentinel_main.py`   : SONNET_MODEL transmis à run_sentinel()
+- `sentinel_main.py`   : articles.extend(tg_arts or []) — garde None
+- `sentinel_main.py`   : port SENTINEL_HEALTH_PORT protégé try/except ValueError
+- `sentinel_main.py`   : spec/loader None guard dans _load_optional_scraper()
+- `report_builder.py`  : RB-41-FIX1 img_to_svg_or_b64 définie (NameError)
+- `report_builder.py`  : RB-41-FIX2 signature build_html_report corrigée
+- `report_builder.py`  : RB-41-FIX3..8 regex markdown_to_html corrigées
+- `report_builder.py`  : RB-41-FIX9..11 double guard, import local, SQLite Row
+- `init_prompts.py`    : IP-41-FIX1..8 tous les correctifs v3.41
 
 ---
 
 ## v3.40 — 2026-04-09
 
 ### Ajouté
-- `db_manager.py`     : BUG-DB1 à BUG-DB7 — UNIQUE, DDL, CRUD, whitelist, LIKE
-- `sentinel_api.py`   : A07-FIX call_api() hors boucle, R6-NEW-2 validation deltas
-- `mailer.py`         : B10 MIME corrects, NEW-M1/M2/M3/M5
-- `samgov_scraper.py` : FIX-SAM1/2/3/4 + NEW-SG3 run_all_procurement()
-- `init_prompts.py`   : NEW-IP1/2/3/4 .env.example, idempotence, validation
-- `report_builder.py` : A13/A14/A23/A24/B3/B10/VIS-3/6/7/VISUAL-R1/R3
+- `db_manager.py`      : BUG-DB1 à BUG-DB7 — UNIQUE, DDL, CRUD, whitelist, LIKE
+- `sentinel_api.py`    : A07-FIX call_api() hors boucle, R6-NEW-2 validation deltas
+- `mailer.py`          : B10 MIME corrects, NEW-M1/M2/M3/M5
+- `samgov_scraper.py`  : FIX-SAM1/2/3/4 + NEW-SG3 run_all_procurement()
+- `init_prompts.py`    : NEW-IP1/2/3/4 .env.example, idempotence, validation
+- `report_builder.py`  : A13/A14/A23/A24/B3/B10/VIS-3/6/7/VISUAL-R1/R3
 
 ### Corrigé
 - Circuit-breaker cb_fail/cb_ok/cb_active consolidés
@@ -550,35 +662,64 @@ Types : Ajouté | Corrigé | Modifié | Supprimé | Sécurité
 ### Ajouté
 - SQLite migration recommandée (E1-5)
 - crossreference_articles() détection événements multi-sources
-- weight_temporal() décroissance exponentielle λ=0.15
+- weight_temporal() décroissance exponentielle lambda=0.15
 
 ### Corrigé
 - scrape_all_feeds() ThreadPoolExecutor — 10 threads max
-- seen_list écriture atomique tmp → rename (A08-FIX)
+- seen_list écriture atomique tmp -> rename (A08-FIX)
 """.strip()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # FONCTIONS UTILITAIRES
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+
+# IP-54-FIX8 — Regex _extract_version() : même protection chr(92) que les autres
+# scripts (TG-R1 / MAIL-R1 / API-52-FIX1). Deux patterns pour couvrir tous les
+# formats de version rencontrés dans les scripts SENTINEL :
+#   vX.Y   dans les commentaires d'en-tête  : "# SENTINEL v3.54 — ..."
+#   vX.Y.Z dans les commentaires d'en-tête  : "# SENTINEL v3.54.1 — ..."
+#   VERSION = "X.Y"  (sans préfixe v)       : VERSION = "3.54"
+_BS = chr(92)
+
+# Pattern 1 : vX.Y ou vX.Y.Z dans les commentaires d'en-tête
+_PAT_VER_COMMENT = re.compile(
+    "[vV]([" + _BS + "d]+[" + _BS + ".][" + _BS + "d]+(?:[" + _BS + ".][" + _BS + "d]+)?)"
+)
+
+# Pattern 2 : VERSION = "X.Y" ou VERSION = 'X.Y' (sans préfixe v)
+_PAT_VER_ASSIGN = re.compile(
+    "VERSION" + _BS + "s*=" + _BS + "s*[" + _BS + "\"'][" + _BS + "'\"]*"
+    "([" + _BS + "d]+[" + _BS + ".][" + _BS + "d]+(?:[" + _BS + ".][" + _BS + "d]+)?)"
+)
+
 
 def _extract_version(script_path: Path) -> str:
     """
-    IP-42-FIX1 : lit la version depuis les 10 premières lignes d'un script Python.
-    Cherche un pattern vX.YY dans les commentaires d'en-tête.
-    Retourne "?" si introuvable ou si le fichier est absent.
+    IP-42-FIX1 + IP-54-FIX8 : lit la version depuis les 15 premières lignes
+    d'un script Python. Retourne "?" si introuvable ou si le fichier est absent.
+
+    IP-54-FIX8 : regex corrigée via chr(92) — la v3.42 et le soumis initial
+    utilisaient r'[vV](d+.d+...)' avec d et . littéraux, retournant "?" pour
+    TOUS les scripts depuis v3.42. Deux patterns couvrent tous les formats :
+      1. Commentaire d'en-tête  : "# SENTINEL v3.54 — description"
+      2. Constante de version   : VERSION = "3.54"
 
     Exemples détectés :
-      # sentinel_main.py — SENTINEL v3.41
-      VERSION = "3.42"
-      # report_builder.py — SENTINEL v3.42
+      "# sentinel_main.py — SENTINEL v3.54"  → "v3.54"
+      "# init_prompts.py — SENTINEL v3.54 —" → "v3.54"
+      'VERSION = "3.54"'                       → "v3.54"
     """
     if not script_path.exists():
         return "?"
     try:
         lines = script_path.read_text(encoding="utf-8").splitlines()[:15]
         for line in lines:
-            m = re.search(r'[vV](d+.d+(?:.d+)?)', line)
+            # Essayer le pattern commentaire en premier (plus spécifique)
+            m = _PAT_VER_COMMENT.search(line)
+            if m:
+                return f"v{m.group(1)}"
+            # Puis le pattern VERSION = "X.Y"
+            m = _PAT_VER_ASSIGN.search(line)
             if m:
                 return f"v{m.group(1)}"
     except OSError:
@@ -590,13 +731,14 @@ def _build_scope_md() -> str:
     """
     IP-42-FIX1 : génère SCOPE.md avec les versions lues dynamiquement
     depuis les scripts présents sur le disque.
-    Élimine la maintenance manuelle à chaque mise à jour de sous-script.
+    IP-54-FIX8 : _extract_version() corrigée — les versions sont maintenant
+    effectivement lues (plus de "?" systématique).
     """
     # ── Table scripts obligatoires ────────────────────────────────────────
     rows_required = []
     for script, role, _ in _SCRIPT_TABLE:
         version = _extract_version(Path(script))
-        status  = "✅" if Path(script).exists() else "⏳ À créer"
+        status  = "OK" if Path(script).exists() else "A creer"
         rows_required.append(f"| `{script}` | {role} | {version} | {status} |")
 
     # ── Table scripts optionnels ──────────────────────────────────────────
@@ -605,7 +747,7 @@ def _build_scope_md() -> str:
         rows_optional.append(f"| `{script}` | {role} | {priority} |")
 
     scope = f"""# SENTINEL — Périmètre & Contraintes (SCOPE.md)
-# Versions lues dynamiquement depuis les scripts (IP-42-FIX1)
+# Versions lues dynamiquement depuis les scripts (IP-42-FIX1 + IP-54-FIX8)
 
 ## Périmètre livrable garanti
 
@@ -638,10 +780,10 @@ def _build_scope_md() -> str:
 
 | Composant | Coût |
 |-----------|------|
-| Claude Sonnet 4.6 (1M tok) | ~4.80 €/mois |
-| Tavily (150 req/j) | 0 € (gratuit) |
-| Hébergement Raspberry Pi 4 | 0 € (électricité ~2 €) |
-| **TOTAL** | **< 10 €/mois** |
+| Claude Sonnet 4.6 (1M tok) | ~4.80 EUR/mois |
+| Tavily (150 req/j) | 0 EUR (gratuit) |
+| Hébergement Raspberry Pi 4 | 0 EUR (électricité ~2 EUR) |
+| **TOTAL** | **< 10 EUR/mois** |
 
 ## Contraintes légales
 
@@ -656,12 +798,12 @@ def _build_scope_md() -> str:
 
 def _write_file(path: Path, content: str, label: str) -> bool:
     """
-    Écrit un fichier de manière atomique (tmp → rename).
+    Écrit un fichier de manière atomique (tmp -> rename).
     Retourne True si écriture effectuée, False si skippée.
 
     IP-41-FIX1 : path.parent / (path.name + ".tmp") au lieu de path.with_suffix(".tmp").
     with_suffix() remplaçait le dernier suffixe — transformait
-    Path(".env.example") → Path(".env.tmp"), cassant l'atomicité silencieusement.
+    Path(".env.example") -> Path(".env.tmp"), cassant l'atomicité silencieusement.
 
     NEW-IP2 : idempotent — ne réécrit pas si déjà présent et --force absent.
     """
@@ -674,7 +816,7 @@ def _write_file(path: Path, content: str, label: str) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(path)
-        log.info(f"ÉCRIT {label} → {path} ({len(content)} chars)")
+        log.info(f"ÉCRIT {label} -> {path} ({len(content)} chars)")
         return True
     except OSError as e:
         if tmp.exists():
@@ -710,7 +852,7 @@ def _create_directories() -> None:
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
-        log.debug(f"DOSSIER {d} ✓")
+        log.debug(f"DOSSIER {d} OK")
     log.info(f"DOSSIERS créés/vérifiés : {[str(d) for d in dirs]}")
 
 
@@ -718,7 +860,11 @@ def _check_integrity() -> dict[str, list[str]]:
     """
     Vérifie l'intégrité de tous les fichiers prompts et de la structure.
     Retourne un dict {fichier: [problèmes]} — vide = tout OK.
+
     IP-41-FIX2 : system.txt vérifié sur son contenu (TAVILYMAX).
+    IP-54-FIX2 : daily.txt vérifié avec ARTICLESFILTRESPARSCRAPER (avec É).
+    IP-54-FIX1 : monthly.txt vérifié avec INJECTIONMENSUELLE.
+    IP-54-FIX4 : modules vérifiés en français.
     """
     issues: dict[str, list[str]] = {}
 
@@ -764,31 +910,31 @@ def _check_integrity() -> dict[str, list[str]]:
     return issues
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # POINT D'ENTRÉE PRINCIPAL (IP-41-FIX3 : main() complétée)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def main() -> int:
     """
     Initialise la structure complète du projet SENTINEL.
     Retourne 0 (succès) ou 1 (erreur détectée).
     """
-    log.info("─" * 60)
-    log.info("SENTINEL v3.42 — Initialisation des prompts & structure projet")
+    log.info("-" * 60)
+    log.info("SENTINEL v3.54 — Initialisation des prompts & structure projet")
     if FORCE_REWRITE:
         log.info("MODE --force : tous les fichiers seront réécrits")
     if CHECK_ONLY:
         log.info("MODE --check : vérification sans réécriture")
-    log.info("─" * 60)
+    log.info("-" * 60)
 
     # ── Mode check-only ───────────────────────────────────────────────────
     if CHECK_ONLY:
         issues = _check_integrity()
         if not issues:
-            log.info("✓ Intégrité OK — tous les fichiers et dossiers sont en place")
+            log.info("OK Intégrité confirmée — tous les fichiers et dossiers sont en place")
             return 0
         else:
-            log.warning(f"✗ {len(issues)} problème(s) détecté(s) :")
+            log.warning(f"KO {len(issues)} problème(s) détecté(s) :")
             for path, problems in issues.items():
                 for p in problems:
                     log.warning(f"  [{path}] {p}")
@@ -797,7 +943,7 @@ def main() -> int:
     # ── Création de la structure de dossiers ──────────────────────────────
     _create_directories()
 
-    # ── Construction dynamique de SCOPE.md (IP-42-FIX1) ─────────────────
+    # ── Construction dynamique de SCOPE.md (IP-42-FIX1 + IP-54-FIX8) ────
     # Appelé ici pour capturer les versions des scripts au moment de l'init,
     # pas au moment de l'import du module.
     scope_md_content = _build_scope_md()
@@ -812,7 +958,7 @@ def main() -> int:
         (Path("prompts/monthly.txt"), MONTHLY_PROMPT,   "prompt mensuel"),
         (Path("requirements.txt"),    REQUIREMENTS_TXT, "requirements.txt"),
         (Path(".env.example"),        ENV_EXAMPLE,      ".env.example"),
-        (Path("SCOPE.md"),            scope_md_content, "SCOPE.md"),  # IP-42-FIX1
+        (Path("SCOPE.md"),            scope_md_content, "SCOPE.md"),
         (Path("CHANGELOG.md"),        CHANGELOG_MD,     "CHANGELOG.md"),
     ]
 
@@ -824,41 +970,42 @@ def main() -> int:
             files_skipped += 1
 
     # ── Validation post-écriture (NEW-IP3) ────────────────────────────────
-    log.info("─" * 60)
+    log.info("-" * 60)
     log.info("Validation des marqueurs après écriture...")
 
     issues = _check_integrity()
 
     if not issues:
-        log.info("✓ Tous les marqueurs validés — prompts cohérents avec sentinel_api.py")
+        log.info("OK Tous les marqueurs validés — prompts cohérents avec sentinel_api.py")
     else:
-        log.error(f"✗ {len(issues)} problème(s) de validation :")
+        log.error(f"KO {len(issues)} problème(s) de validation :")
         for path, problems in issues.items():
             for p in problems:
                 log.error(f"  [{path}] {p}")
 
     # ── Résumé final ──────────────────────────────────────────────────────
-    log.info("─" * 60)
+    log.info("-" * 60)
     log.info(f"RÉSUMÉ : {files_written} fichier(s) écrit(s), {files_skipped} ignoré(s)")
 
     if not Path(".env").exists():
         log.warning(
             "ATTENTION : fichier .env absent. "
-            "Copier .env.example → .env et remplir ANTHROPIC_API_KEY et SMTP_PASS."
+            "Copier .env.example -> .env et remplir ANTHROPIC_API_KEY et SMTP_PASS."
         )
 
     if issues:
         log.error("Initialisation terminée avec erreurs. Voir logs ci-dessus.")
         return 1
 
-    log.info("✓ Initialisation SENTINEL v3.42 terminée avec succès.")
-    log.info("  Prochaine étape : python sentinel_main.py")
+    log.info("OK Initialisation SENTINEL v3.54 terminée avec succès.")
+    log.info("   Prochaine étape : python sentinel_main.py")
     return 0
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # ENTRÉE
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 if __name__ == "__main__":
     sys.exit(main())
+
