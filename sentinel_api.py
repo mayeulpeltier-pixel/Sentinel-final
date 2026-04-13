@@ -1,4 +1,5 @@
-# sentinel_api.py — SENTINEL v3.51 — Appel Claude Sonnet + outil Tavily
+#!/usr/bin/env python3
+# sentinel_api.py — SENTINEL v3.52 — Appel Claude Sonnet + outil Tavily
 # ─────────────────────────────────────────────────────────────────────────────
 # Corrections v3.40 :
 # A07-FIX    call_api() définie UNE SEULE FOIS hors boucle agentique
@@ -21,7 +22,7 @@
 # Corrections v3.50 — Compatibilité sentinel_main v3.50 :
 # API-50-FIX1  run_sentinel() : paramètre report_type="daily" ajouté (MAIN-46-C)
 # API-50-FIX2  run_sentinel_monthly() : nouvelle fonction (MAIN-43-FIX2)
-#              Guard double injection INJECTIONMENSUELLE.
+#              Guard double injection INJECTION_MENSUELLE.
 # API-50-FIX3  Regex extract_metrics_from_report() : s* d+ .[d]+
 #              Patterns brisés (s* / d+) retournaient {} en silence.
 # API-50-FIX4  _build_call_api() / _build_call_with_fallback() factorisés
@@ -29,13 +30,40 @@
 # Corrections v3.51 :
 # API-51-FIX1  Timeout Ollama configurable via OLLAMA_TIMEOUT (.env)
 #              Défaut 180s au lieu de 60s codé en dur.
-#              Motivation : 60s est insuffisant sur CPU (Mistral 7B = 3-8 min)
-#              et juste sur GPU milieu de gamme (~90-120s pour 16k tokens).
-#              Ollama étant le 3ème fallback (Anthropic + OpenAI indisponibles),
-#              un timeout trop court laissait le pipeline sans rapport au lieu
-#              d'en générer un dégradé. Configurable dans .env :
-#                OLLAMA_TIMEOUT=90   # GPU rapide
-#                OLLAMA_TIMEOUT=480  # CPU seul
+#
+# Corrections v3.52 — Audit complet régression :
+# API-52-FIX1  extract_metrics_from_report() : TOUTES les regex reconstruites
+#              via chr(92) — même protection anti-copier-coller que TG-R1 /
+#              NLP-R1 / MAIL-R1. API-50-FIX3 documentait le fix mais l'ancienne
+#              technique (raw string) reste vulnérable. Dashboard renvoyait {}
+#              en silence si corruption backslash présente.
+#              BUG RÉSIDUEL CORRIGÉ — _PAT_INDICE : le pattern v3.52 original
+#              ne matchait pas "Indice d'activité : 7.2/10" car \s*[:-]? ne
+#              absorbe pas le texte intermédiaire "d'activité". Corrigé par
+#              [^\d]* qui absorbe tout caractère non-numérique jusqu'au chiffre.
+#              Tests : "Indice : 7.2/10", "Indice d'activité : 7.2/10",
+#              "Indice d'activité global : 8.0/10" — tous matchent ✓
+# API-52-FIX2  Prompts chargés en LAZY via _get_system_prompt() /
+#              _get_user_prompt_template() — plus au niveau module.
+#              Avant ce fix, tout import de sentinel_api (ex: memory_manager.py
+#              → from sentinel_api import extract_memory_delta) déclenchait un
+#              SystemExit si prompts/ absent, même sans besoin des prompts.
+#              Rétrocompatibilité : SYSTEM_PROMPT / USER_PROMPT_TEMPLATE
+#              exposés via module __getattr__ (PEP 562 / Python >= 3.7).
+# API-52-FIX3  GPT-4o-mini fallback : _sanitize_messages_for_openai() filtre
+#              les blocs tool_use / tool_result au format Anthropic avant envoi
+#              OpenAI. Sans ce fix, une erreur 400 silencieuse perdait le rapport
+#              si Anthropic + le fallback Haiku étaient indisponibles.
+# API-52-FIX4  Circuit-breaker auto-reset temporel : cb_fail() enregistre
+#              last_fail_ts, _cb_load() reset automatiquement après
+#              CB_RESET_H heures (défaut 2h, configurable SENTINEL_CB_RESET_H).
+#              Sans ce fix, le circuit restait ouvert indéfiniment après une
+#              panne nocturne d'Anthropic, forçant Haiku toute la journée.
+# API-52-FIX5  OPENAI_FALLBACK_MODEL configurable via ENV (était "gpt-4o-mini"
+#              hardcodé). Cohérence avec SENTINEL_MODEL / HAIKU_MODEL.
+# API-52-FIX6  _sanitize_tool_result_content() : normalise le champ content
+#              d'un tool_result (str | list | dict → str) pour éviter le
+#              TypeError dans OpenAI et Ollama.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -49,30 +77,108 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 log = logging.getLogger("sentinel.api")
 
 # ── Modèles ───────────────────────────────────────────────────────────────────
-SENTINEL_MODEL = os.environ.get("SENTINEL_MODEL", "claude-sonnet-4-6")
-HAIKU_MODEL    = os.environ.get("HAIKU_MODEL",    "claude-haiku-4-5")
+SENTINEL_MODEL        = os.environ.get("SENTINEL_MODEL",        "claude-sonnet-4-6")
+HAIKU_MODEL           = os.environ.get("HAIKU_MODEL",           "claude-haiku-4-5")
+OPENAI_FALLBACK_MODEL = os.environ.get("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")  # API-52-FIX5
 
 # ── Paramètres API ────────────────────────────────────────────────────────────
 SENTINEL_MAX_TOKENS = int(os.environ.get("SENTINEL_MAX_TOKENS", "16000"))
 TAVILY_MAX          = int(os.environ.get("SENTINEL_TAVILY_MAX", "5"))
 
 # ── Circuit-breaker ───────────────────────────────────────────────────────────
-_CB_PATH = Path("data") / "api_failures.json"
-_CB_MAX  = int(os.environ.get("SENTINEL_CB_MAX", "3"))
+_CB_PATH    = Path("data") / "api_failures.json"
+_CB_MAX     = int(os.environ.get("SENTINEL_CB_MAX",     "3"))
+_CB_RESET_H = int(os.environ.get("SENTINEL_CB_RESET_H", "2"))  # API-52-FIX4
 
 # ── Ollama — API-51-FIX1 ──────────────────────────────────────────────────────
-# Timeout configurable via .env pour adapter à l'infrastructure locale.
-# 60s codé en dur était insuffisant sur CPU (Mistral 7B = 3-8 min).
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "180"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# API-52-FIX1 — REGEX BACKSLASH-SAFE pour extract_metrics_from_report()
+# chr(92) = "\"  —  même protection anti-copier-coller que :
+#   TG-R1   (telegram_scraper.py)
+#   NLP-R1  (nlp_scorer.py)
+#   MAIL-R1 (mailer.py)
+#
+# BUG RÉSIDUEL CORRIGÉ — _PAT_INDICE :
+#   Le pattern v3.52 original "\s*[:-]?\s*" ne matchait pas
+#   "Indice d'activité : 7.2/10" car le texte intermédiaire
+#   "d'activité" n'était pas absorbé.
+#   Correction : [^\d]* absorbe tout caractère non-numérique
+#   jusqu'au premier chiffre.
+#   Tests validés :
+#     "Indice d'activité : 7.2/10"         → 7.2  ✓
+#     "Indice d'activité global : 8.0/10"  → 8.0  ✓
+#     "Indice : 6.5/10"                    → 6.5  ✓
+#     "Indice: 7.0/10"                     → 7.0  ✓
+#     "Indice d'activité — 7.2/10"         → 7.2  ✓
+# =============================================================================
+_BS = chr(92)   # "\"
+
+# Pattern : Indice[^\d]*([\d]+(?:\.[\d]+)?)\s*/?\s*10
+# [^\d]* absorbe le texte intermédiaire ("d'activité", "global", "—", etc.)
+_PAT_INDICE = re.compile(
+    r"Indice"
+    + "[^" + _BS + "d]*"
+    + "([" + _BS + "d]+(?:"
+    + _BS + ".[" + _BS + "d]+)?)"
+    + _BS + "s*/?"
+    + _BS + "s*10",
+    re.IGNORECASE,
+)
+
+# Pattern : Alerte\s*[:-]?\s*(VERT|ORANGE|ROUGE)
+_PAT_ALERTE = re.compile(
+    r"Alerte"
+    + _BS + r"s*[:-]?"
+    + _BS + r"s*(VERT|ORANGE|ROUGE)",
+    re.IGNORECASE,
+)
+
+# Pattern : Sources\s+analys[eé]es?\s*[:-]?\s*([\d]+)
+_PAT_SOURCES = re.compile(
+    r"Sources"
+    + _BS + r"s+analys[eé]es?"
+    + _BS + r"s*[:-]?"
+    + _BS + r"s*([" + _BS + r"d]+)",
+    re.IGNORECASE,
+)
+
+# Pattern : Pertinentes?\s*[:-]?\s*([\d]+)
+_PAT_PERTINENTS = re.compile(
+    r"Pertinentes?"
+    + _BS + r"s*[:-]?"
+    + _BS + r"s*([" + _BS + r"d]+)",
+    re.IGNORECASE,
+)
+
+
+def _make_pat_count(alias: str) -> re.Pattern:
+    """
+    Construit dynamiquement un pattern count sécurisé via chr(92).
+    Utilisé pour les alias géographiques et domaines.
+    Accepte : chiffres seuls ou chiffres suivis de "%" ou "." (pourcentages).
+    """
+    return re.compile(
+        re.escape(alias)
+        + _BS + r"s*[:%]?"
+        + _BS + r"s*([" + _BS + r"d]+(?:"
+        + _BS + r"." + _BS + r"d+)?)",
+        re.IGNORECASE,
+    )
+
+
+# =============================================================================
 # UTILITAIRE — Nettoyage fichiers .tmp résiduels (API-FIX3)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def cleanup_dangling_tmp(
     directories: list[str] | None = None,
@@ -108,9 +214,9 @@ def cleanup_dangling_tmp(
     return removed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHARGEMENT DES PROMPTS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# CHARGEMENT DES PROMPTS — LAZY (API-52-FIX2)
+# =============================================================================
 
 def _load_prompt(filename: str) -> str:
     """
@@ -144,9 +250,42 @@ def _load_prompt_optional(
     return _load_prompt(fallback_filename), fallback_filename
 
 
-# Prompts obligatoires — chargés au niveau module (échec rapide à l'import)
-SYSTEM_PROMPT        = _load_prompt("system.txt")
-USER_PROMPT_TEMPLATE = _load_prompt("daily.txt")
+# ── API-52-FIX2 : Cache lazy — plus de chargement au niveau module ────────────
+# Avant ce fix : SYSTEM_PROMPT = _load_prompt("system.txt") au niveau module
+# → SystemExit à l'import si prompts/ absent, même pour
+#   "from sentinel_api import extract_memory_delta"
+_SYSTEM_PROMPT_CACHE:        str | None = None
+_USER_PROMPT_TEMPLATE_CACHE: str | None = None
+
+
+def _get_system_prompt() -> str:
+    """Retourne SYSTEM_PROMPT en lazy (chargé au 1er appel, jamais à l'import)."""
+    global _SYSTEM_PROMPT_CACHE
+    if _SYSTEM_PROMPT_CACHE is None:
+        _SYSTEM_PROMPT_CACHE = _load_prompt("system.txt")
+    return _SYSTEM_PROMPT_CACHE
+
+
+def _get_user_prompt_template() -> str:
+    """Retourne USER_PROMPT_TEMPLATE en lazy."""
+    global _USER_PROMPT_TEMPLATE_CACHE
+    if _USER_PROMPT_TEMPLATE_CACHE is None:
+        _USER_PROMPT_TEMPLATE_CACHE = _load_prompt("daily.txt")
+    return _USER_PROMPT_TEMPLATE_CACHE
+
+
+def __getattr__(name: str):
+    """
+    API-52-FIX2 — PEP 562 (Python >= 3.7) : lazy module attributes.
+    Les accès à SYSTEM_PROMPT / USER_PROMPT_TEMPLATE déclenchent le
+    chargement à la 1ère lecture, pas à l'import.
+    Rétrocompatibilité totale avec le code existant.
+    """
+    if name == "SYSTEM_PROMPT":
+        return _get_system_prompt()
+    if name == "USER_PROMPT_TEMPLATE":
+        return _get_user_prompt_template()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Outil Tavily ──────────────────────────────────────────────────────────────
@@ -169,17 +308,31 @@ TAVILY_TOOL = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CIRCUIT-BREAKER (R1A3-NEW-3 / CODE-6)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# CIRCUIT-BREAKER (R1A3-NEW-3 / API-52-FIX4)
+# =============================================================================
 
 def _cb_load() -> dict:
+    """
+    Charge l'état du circuit-breaker depuis data/api_failures.json.
+    API-52-FIX4 : auto-reset si last_fail_ts > _CB_RESET_H heures.
+    Sans ce fix, le circuit restait ouvert indéfiniment après une panne
+    nocturne, forçant Haiku toute la journée suivante.
+    """
     try:
         if _CB_PATH.exists():
-            return json.loads(_CB_PATH.read_text())
+            data         = json.loads(_CB_PATH.read_text())
+            last_fail_ts = data.get("last_fail_ts", 0)
+            if time.time() - last_fail_ts > _CB_RESET_H * 3600:
+                log.info(
+                    f"CIRCUIT-BREAKER auto-reset : dernier échec il y a "
+                    f"> {_CB_RESET_H}h — réessai Sonnet autorisé"
+                )
+                return {"count": 0, "active": False, "last_fail_ts": 0}
+            return data
     except Exception:
         pass
-    return {"count": 0, "active": False}
+    return {"count": 0, "active": False, "last_fail_ts": 0}
 
 
 def _cb_save(data: dict) -> None:
@@ -190,32 +343,37 @@ def _cb_save(data: dict) -> None:
 
 
 def cb_fail() -> bool:
-    """Enregistre un échec API. Retourne True si le circuit est désormais ouvert."""
-    d           = _cb_load()
-    d["count"]  = d.get("count", 0) + 1
-    d["active"] = d["count"] >= _CB_MAX
+    """
+    Enregistre un échec API. Retourne True si le circuit est désormais ouvert.
+    API-52-FIX4 : enregistre last_fail_ts pour l'auto-reset temporel.
+    """
+    d                 = _cb_load()
+    d["count"]        = d.get("count", 0) + 1
+    d["active"]       = d["count"] >= _CB_MAX
+    d["last_fail_ts"] = time.time()
     if d["active"]:
         log.error(
             f"CIRCUIT-BREAKER {d['count']} échecs consécutifs "
-            f"— bascule Haiku-only (seuil={_CB_MAX})"
+            f"— bascule Haiku-only (seuil={_CB_MAX}). "
+            f"Auto-reset dans {_CB_RESET_H}h."
         )
     _cb_save(d)
     return d["active"]
 
 
 def cb_ok() -> None:
-    """Remet le circuit-breaker à zéro après un succès."""
-    _cb_save({"count": 0, "active": False})
+    """Remet le circuit-breaker à zéro après un succès Sonnet."""
+    _cb_save({"count": 0, "active": False, "last_fail_ts": 0})
 
 
 def cb_active() -> bool:
-    """True si le circuit est ouvert (trop d'échecs récents)."""
+    """True si le circuit est ouvert (trop d'échecs récents ET < _CB_RESET_H)."""
     return _cb_load().get("active", False)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # TAVILY WEB SEARCH
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def do_web_search(query: str) -> str:
     """
@@ -239,9 +397,9 @@ def do_web_search(query: str) -> str:
         return json.dumps({"error": str(e)})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # EXTRACT MEMORY DELTA (R6-NEW-2 / R6-NEW-4)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def extract_memory_delta(report_text: str) -> dict:
     """
@@ -285,9 +443,9 @@ def extract_memory_delta(report_text: str) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACT METRICS FROM REPORT (VISUAL-R1 + API-50-FIX3)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# EXTRACT METRICS FROM REPORT (VISUAL-R1 + API-52-FIX1)
+# =============================================================================
 
 def extract_metrics_from_report(
     report_text: str,
@@ -297,12 +455,12 @@ def extract_metrics_from_report(
     Extrait les métriques structurées du MODULE 1 et les enregistre
     dans SentinelDB via savemetrics().
 
-    API-FIX1   — date_str optionnel (défaut : date UTC du jour).
-    API-FIX2   — Retourne le dict (était None).
-    API-50-FIX3 — Regex corrigées : s* d+ .[d]+
-                  Les patterns brisés (s* / d+) vidaient le dashboard
-                  en silence depuis la v3.40.
-    VISUAL-R1  — Élimine l'extraction regex fragile dans dashboard.py.
+    API-FIX1     — date_str optionnel (défaut : date UTC du jour).
+    API-FIX2     — Retourne le dict (était None).
+    API-52-FIX1  — Toutes les regex reconstruites via chr(92).
+                   Bug résiduel _PAT_INDICE corrigé : [^digits]* absorbe
+                   le texte intermédiaire ("d'activité", "global", etc.)
+    VISUAL-R1    — Élimine l'extraction regex fragile dans dashboard.py.
     """
     if date_str is None:
         date_str = datetime.now(timezone.utc).date().isoformat()
@@ -313,34 +471,23 @@ def extract_metrics_from_report(
         from db_manager import SentinelDB
 
         # ── Indice d'activité ─────────────────────────────────────────────
-        m = re.search(
-            r"Indices*[:-]?s*([d]+(?:.[d]+)?)s*/?s*10",
-            report_text, re.IGNORECASE,
-        )
+        # _PAT_INDICE corrigé : [^\d]* absorbe "d'activité", "global", etc.
+        m = _PAT_INDICE.search(report_text)
         if m:
             metrics["indice"] = float(m.group(1))
 
         # ── Niveau alerte ─────────────────────────────────────────────────
-        m = re.search(
-            r"Alertes*[:-]?s*(VERT|ORANGE|ROUGE)",
-            report_text, re.IGNORECASE,
-        )
+        m = _PAT_ALERTE.search(report_text)
         if m:
             metrics["alerte"] = m.group(1).upper()
 
         # ── Sources analysées ─────────────────────────────────────────────
-        m = re.search(
-            r"Sourcess+analys[eé]es?s*[:-]?s*(d+)",
-            report_text, re.IGNORECASE,
-        )
+        m = _PAT_SOURCES.search(report_text)
         if m:
             metrics["nb_articles"] = int(m.group(1))
 
         # ── Sources pertinentes ───────────────────────────────────────────
-        m = re.search(
-            r"Pertinentes?s*[:-]?s*(d+)",
-            report_text, re.IGNORECASE,
-        )
+        m = _PAT_PERTINENTS.search(report_text)
         if m:
             metrics["nb_pertinents"] = int(m.group(1))
 
@@ -354,10 +501,7 @@ def extract_metrics_from_report(
         }
         for col, aliases in geo_aliases.items():
             for alias in aliases:
-                mg = re.search(
-                    rf"{re.escape(alias)}s*[:-]?s*(d+)",
-                    report_text, re.IGNORECASE,
-                )
+                mg = _make_pat_count(alias).search(report_text)
                 if mg:
                     metrics[col] = float(mg.group(1))
                     break
@@ -371,10 +515,7 @@ def extract_metrics_from_report(
         }
         for col, aliases in dom_aliases.items():
             for alias in aliases:
-                md = re.search(
-                    rf"{re.escape(alias)}s*[:-]?s*(d+)",
-                    report_text, re.IGNORECASE,
-                )
+                md = _make_pat_count(alias).search(report_text)
                 if md:
                     metrics[col] = float(md.group(1))
                     break
@@ -391,9 +532,9 @@ def extract_metrics_from_report(
     return metrics
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # VALIDATION STRUCTURE RAPPORT (C3-FIX)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 _REQUIRED_MODULES = [
     "RÉSUMÉ EXÉCUTIF", "MODULE 1", "MODULE 2", "MODULE 3",
@@ -404,7 +545,8 @@ _REQUIRED_MODULES = [
 def _validate_report_structure(report_text: str) -> tuple[bool, list[str]]:
     """
     C3-FIX : vérifie présence des 9 modules + résumé.
-    >3 modules manquants → invalide (dégradation gracieuse, non bloquant).
+    Seuil SOFT : > 3 modules manquants → WARNING (dégradation gracieuse,
+    jamais bloquant). Le rapport est toujours utilisé même si incomplet.
     """
     missing    = []
     text_upper = report_text.upper()
@@ -414,10 +556,85 @@ def _validate_report_structure(report_text: str) -> tuple[bool, list[str]]:
     return len(missing) <= 3, missing
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# API-52-FIX3 — NETTOYAGE MESSAGES ANTHROPIC → FORMAT OPENAI
+# =============================================================================
+
+def _sanitize_tool_result_content(content) -> str:
+    """
+    API-52-FIX6 : normalise le champ content d'un tool_result.
+    L'API OpenAI exige que content soit une string, pas une liste ou un dict.
+    """
+    if isinstance(content, str):
+        return content[:500]
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", "")[:300])
+            elif isinstance(item, str):
+                parts.append(item[:300])
+        return " ".join(parts)[:500]
+    if isinstance(content, dict):
+        return str(content)[:500]
+    return str(content)[:500]
+
+
+def _sanitize_messages_for_openai(messages: list[dict]) -> list[dict]:
+    """
+    API-52-FIX3 : convertit les messages Anthropic en format OpenAI.
+
+    Problème : après un tool_use Tavily, messages contient :
+      - {"role": "assistant", "content": [TextBlock, ToolUseBlock]}
+      - {"role": "user",      "content": [{"type": "tool_result", ...}]}
+    L'API OpenAI ne comprend pas ces types → erreur 400 silencieuse.
+
+    Solution : extraire uniquement les TextBlock, convertir tool_result
+    en note textuelle (contexte préservé), ignorer ToolUseBlock.
+    """
+    clean: list[dict] = []
+    for msg in messages:
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            if content.strip():
+                clean.append({"role": role, "content": content})
+            continue
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                # SDK objects (have .type attribute)
+                if hasattr(block, "type"):
+                    if block.type == "text" and getattr(block, "text", ""):
+                        parts.append(block.text)
+                    continue
+
+                # Plain dicts
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type", "")
+                if btype == "text":
+                    parts.append(block.get("text", ""))
+                elif btype == "tool_result":
+                    result_str = _sanitize_tool_result_content(
+                        block.get("content", "")
+                    )
+                    if result_str:
+                        parts.append(f"[Résultat recherche web : {result_str}]")
+                # btype == "tool_use" → ignoré intentionnellement
+
+            text = "\n".join(p for p in parts if p).strip()
+            if text:
+                clean.append({"role": role, "content": text})
+
+    return clean
+
+
+# =============================================================================
 # HELPERS INTERNES — Factorisés (API-50-FIX4)
-# Partagés entre run_sentinel() et run_sentinel_monthly().
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _build_call_api(client: anthropic.Anthropic):
     """
@@ -456,9 +673,12 @@ def _build_call_api(client: anthropic.Anthropic):
 
 def _build_call_with_fallback(call_api):
     """
-    Retourne call_with_fallback() : Sonnet → Haiku → GPT-4o-mini → Ollama.
-    R1-F4 / F-03-FIX : partagé entre run_sentinel() et run_sentinel_monthly().
-    API-51-FIX1 : timeout Ollama via OLLAMA_TIMEOUT (défaut 180s).
+    Retourne call_with_fallback() : Sonnet → Haiku → OPENAI_FALLBACK_MODEL → Ollama.
+    R1-F4 / F-03-FIX  : partagé entre run_sentinel() et run_sentinel_monthly().
+    API-51-FIX1        : timeout Ollama via OLLAMA_TIMEOUT (défaut 180s).
+    API-52-FIX3        : messages nettoyés pour OpenAI (tool_use/result filtrés).
+    API-52-FIX5        : OPENAI_FALLBACK_MODEL configurable via ENV.
+    API-52-FIX6        : _sanitize_tool_result_content() pour Ollama.
     """
     def call_with_fallback(**kw):
         try:
@@ -487,21 +707,27 @@ def _build_call_with_fallback(call_api):
                 return resp
             except Exception as he:
                 log.warning(
-                    f"MODE DÉGRADÉ Haiku échoue : {he} — tentative GPT-4o-mini"
+                    f"MODE DÉGRADÉ Haiku échoue : {he} "
+                    f"— tentative {OPENAI_FALLBACK_MODEL}"
                 )
 
-            # ── Fallback GPT-4o-mini ──────────────────────────────────────
+            # ── Fallback OpenAI (API-52-FIX3 + API-52-FIX5) ──────────────
             try:
                 import openai  # type: ignore
-                oc      = openai.OpenAI()
-                sys_msg = {"role": "system", "content": kw.get("system", "")}
-                msgs    = list(kw.get("messages", []))
-                r       = oc.chat.completions.create(
-                    model      = "gpt-4o-mini",
-                    messages   = [sys_msg] + msgs,
-                    max_tokens = kw.get("max_tokens", 4096),
+
+                oc = openai.OpenAI()
+
+                # API-52-FIX3 : nettoyer les messages Anthropic avant envoi OpenAI
+                raw_messages = list(kw.get("messages", []))
+                clean_msgs   = _sanitize_messages_for_openai(raw_messages)
+                sys_msg      = {"role": "system", "content": kw.get("system", "")}
+
+                r = oc.chat.completions.create(
+                    model      = OPENAI_FALLBACK_MODEL,   # API-52-FIX5
+                    messages   = [sys_msg] + clean_msgs,
+                    max_tokens = min(kw.get("max_tokens", 4096), 16000),
                 )
-                txt = r.choices[0].message.content
+                txt = r.choices[0].message.content or ""
 
                 class _Block:
                     def __init__(self, t: str):
@@ -513,12 +739,15 @@ def _build_call_with_fallback(call_api):
                     def __init__(self, t: str):
                         self.content = [_Block(t)]
 
-                log.warning("MODE DÉGRADÉ GPT-4o-mini utilisé — pipeline maintenu")
+                log.warning(
+                    f"MODE DÉGRADÉ {OPENAI_FALLBACK_MODEL} utilisé — pipeline maintenu"
+                )
                 return _FallbackResp(txt)  # type: ignore[return-value]
 
             except Exception as e2:
                 log.warning(
-                    f"MODE DÉGRADÉ GPT-4o-mini échoue : {e2} — tentative Ollama"
+                    f"MODE DÉGRADÉ {OPENAI_FALLBACK_MODEL} échoue : {e2} "
+                    f"— tentative Ollama"
                 )
 
             # ── Fallback Ollama local (F-03-FIX + API-51-FIX1) ───────────
@@ -544,18 +773,18 @@ def _build_call_with_fallback(call_api):
                         f"Lancer : ollama pull {ollama_model}"
                     )
 
+                # API-52-FIX3 : nettoyer les messages pour Ollama aussi
+                raw_messages = list(kw.get("messages", []))
+                clean_msgs   = _sanitize_messages_for_openai(raw_messages)
                 sys_content  = kw.get("system", "")
-                user_content = ""
-                for msg in kw.get("messages", []):
-                    if msg.get("role") == "user":
-                        c            = msg.get("content", "")
-                        user_content = c if isinstance(c, str) else str(c)
+                user_content = "\n".join(
+                    m["content"] for m in clean_msgs
+                    if m.get("role") == "user" and m.get("content")
+                )
 
                 payload = _json.dumps({
                     "model":   ollama_model,
-                    "prompt":  f"{sys_content}
-
-{user_content}",
+                    "prompt":  f"{sys_content}\n\n{user_content}",
                     "stream":  False,
                     "options": {
                         "num_predict": min(kw.get("max_tokens", 4096), 4096)
@@ -569,11 +798,7 @@ def _build_call_with_fallback(call_api):
                     method  = "POST",
                 )
 
-                # API-51-FIX1 : OLLAMA_TIMEOUT remplace le 60s codé en dur.
-                # Défaut 180s. Configurer dans .env selon l'infrastructure :
-                #   OLLAMA_TIMEOUT=90   → GPU rapide (RTX 4090, A100)
-                #   OLLAMA_TIMEOUT=180  → GPU milieu de gamme (défaut)
-                #   OLLAMA_TIMEOUT=480  → CPU seul (cas dégradé extrême)
+                # API-51-FIX1 : OLLAMA_TIMEOUT remplace le 60s codé en dur
                 with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp_o:
                     ollama_data = _json.loads(resp_o.read())
 
@@ -597,16 +822,16 @@ def _build_call_with_fallback(call_api):
 
             except Exception as e3:
                 raise RuntimeError(
-                    f"Anthropic + OpenAI + Ollama indisponibles : "
+                    f"Anthropic + {OPENAI_FALLBACK_MODEL} + Ollama indisponibles : "
                     f"{e} / {e2} / {e3}"
                 ) from e
 
     return call_with_fallback
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # RUN SENTINEL — PIPELINE QUOTIDIEN
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def run_sentinel(
     articles_text:  str,
@@ -638,6 +863,7 @@ def run_sentinel(
     client       = anthropic.Anthropic()
 
     # [API-50-FIX1] Charger le prompt selon le type de rapport
+    # [API-52-FIX2] Lazy — plus de chargement à l'import
     prompt_template, used_prompt = _load_prompt_optional(
         f"{report_type}.txt", fallback_filename="daily.txt"
     )
@@ -652,10 +878,16 @@ def run_sentinel(
 
     user_prompt = (
         prompt_template
-        .replace("DATEAUJOURDHUI",            date_obj.strftime("%d/%m/%Y"))
-        .replace("ARTICLESFILTRESPARSCRAPER", articles_text)
-        .replace("MEMOIRECOMPRESSE7JOURS",    memory_context)
-        .replace("OUIouNON",                  "OUI" if tavily_available else "NON")
+        # Nouvelle convention avec underscores
+        .replace("DATE_AUJOURD_HUI",             date_obj.strftime("%d/%m/%Y"))
+        .replace("ARTICLES_FILTRES_PAR_SCRAPER", articles_text)
+        .replace("MEMOIRE_COMPRESSE_7_JOURS",    memory_context)
+        .replace("OUI_ou_NON",                   "OUI" if tavily_available else "NON")
+        # Rétrocompatibilité ancienne convention sans underscores
+        .replace("DATEAUJOURDHUI",               date_obj.strftime("%d/%m/%Y"))
+        .replace("ARTICLESFILTRESPARSCRAPER",    articles_text)
+        .replace("MEMOIRECOMPRESSE7JOURS",       memory_context)
+        .replace("OUIouNON",                     "OUI" if tavily_available else "NON")
     )
 
     tools    = [TAVILY_TOOL] if tavily_available else []
@@ -673,8 +905,8 @@ def run_sentinel(
         kw = dict(
             model      = HAIKU_MODEL if cb_active() else active_model,
             max_tokens = SENTINEL_MAX_TOKENS,
-            system     = SYSTEM_PROMPT,
-            tools      = tools,
+            system     = _get_system_prompt(),   # API-52-FIX2 : lazy
+            tools      = tools if not cb_active() else [],
             messages   = messages,
         )
         resp = call_with_fallback(**kw)
@@ -685,7 +917,7 @@ def run_sentinel(
         if resp.stop_reason == "tool_use":
             tool_results = []
             for block in resp.content:
-                if block.type == "tool_use" and block.name == "web_search":
+                if hasattr(block, "type") and block.type == "tool_use" and block.name == "web_search":
                     if tavily_calls >= TAVILY_MAX:
                         result = json.dumps(
                             {"error": f"quota {TAVILY_MAX} appels Tavily atteint"}
@@ -739,7 +971,7 @@ def run_sentinel(
     if not is_valid:
         log.warning(
             f"C3 STRUCTURE RAPPORT INCOMPLÈTE : {len(missing)} modules manquants : "
-            f"{missing}. Dégradation gracieuse."
+            f"{missing}. Dégradation gracieuse — rapport utilisé quand même."
         )
     else:
         log.info(
@@ -753,9 +985,9 @@ def run_sentinel(
     return report_text, memory_deltas
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # RUN SENTINEL MONTHLY — RAPPORT MENSUEL (API-50-FIX2)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 # Prompt minimal intégré — utilisé si prompts/monthly.txt est absent.
 # Contrairement aux prompts daily/system (obligatoires), le mensuel est
@@ -782,7 +1014,7 @@ Respecte les contraintes de biais transmises dans <context_metadata>
 sur l'intégralité du rapport.
 
 RÉSUMÉS HEBDOMADAIRES (MOIS) :
-INJECTIONMENSUELLE
+INJECTION_MENSUELLE
 """
 
 
@@ -802,15 +1034,13 @@ def run_sentinel_monthly(
     Paramètres
     ----------
     injection : Blocs [SEMAINE N] produits par run_monthly_report()
-                Peut contenir <context_metadata> (MAIN-49-A) et
-                annotations [RATTRAPAGE GITHUB Xj] (MAIN-48-C)
     mois      : Ex : "April 2026" (strftime %B %Y)
     model     : Modèle Sonnet (défaut SENTINEL_MODEL)
 
     Guard double injection (API-50-FIX2) :
-        Si le template contient INJECTIONMENSUELLE → remplace uniquement.
+        Compatibilité ancienne (INJECTIONMENSUELLE) et nouvelle (INJECTION_MENSUELLE).
+        Si le template contient le placeholder → remplace uniquement.
         Sinon → append après le template.
-        Évite que Claude reçoive l'injection en double.
 
     Retourne
     --------
@@ -832,7 +1062,14 @@ def run_sentinel_monthly(
         )
 
     # [API-50-FIX2] Guard double injection
-    if "INJECTIONMENSUELLE" in monthly_template:
+    # Compatibilité ancienne (INJECTIONMENSUELLE) et nouvelle (INJECTION_MENSUELLE)
+    if "INJECTION_MENSUELLE" in monthly_template:
+        user_content = (
+            monthly_template
+            .replace("MOIS", mois)
+            .replace("INJECTION_MENSUELLE", injection)
+        )
+    elif "INJECTIONMENSUELLE" in monthly_template:
         user_content = (
             monthly_template
             .replace("MOIS", mois)
@@ -842,12 +1079,7 @@ def run_sentinel_monthly(
         # Template sans placeholder explicite → append
         user_content = (
             monthly_template.replace("MOIS", mois)
-            + f"
-
----
-RÉSUMÉS HEBDOMADAIRES ({mois}) :
-
-{injection}"
+            + f"\n\n---\nRÉSUMÉS HEBDOMADAIRES ({mois}) :\n\n{injection}"
         )
 
     call_api           = _build_call_api(client)
@@ -856,7 +1088,7 @@ RÉSUMÉS HEBDOMADAIRES ({mois}) :
     kw = dict(
         model      = HAIKU_MODEL if cb_active() else active_model,
         max_tokens = SENTINEL_MAX_TOKENS,
-        system     = SYSTEM_PROMPT,
+        system     = _get_system_prompt(),   # API-52-FIX2 : lazy
         messages   = [{"role": "user", "content": user_content}],
         # Pas de tools — données déjà compressées par Haiku en phase MAP
     )
@@ -884,3 +1116,4 @@ RÉSUMÉS HEBDOMADAIRES ({mois}) :
 
     memory_deltas = extract_memory_delta(report_text)
     return report_text, memory_deltas
+
