@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# sentinel_main.py --- SENTINEL v3.54 --- ORCHESTRATEUR PRINCIPAL
+# sentinel_main.py — SENTINEL v3.60 — ORCHESTRATEUR PRINCIPAL
 # =============================================================================
-# [historique v3.41 → v3.51 conservé dans le dépôt Git — omis ici pour lisibilité]
+# [historique v3.41 → v3.54 conservé dans le dépôt Git — omis ici]
 #
-# v3.52 — Corrections post-audit externe :
+# v3.52 :
 #   MAIN-52-FIX1  Guard + log WARNING si github_days_back rejeté par DB
 #   MAIN-52-FIX2  deltas = extract_memory_delta(...) or {} — guard None
 #   MAIN-52-FIX3  _should_run_github() → (bool, int, str|None) — une seule lecture
@@ -13,27 +13,52 @@
 " dans les f-strings
 #   MAIN-52-FIX7  Lock threading sur _ensure_health_server()
 #
-# v3.53 — Corrections post-audit v3.52 :
-#   MAIN-53-FIX1  REGRESSION-1 : SyntaxError Python 3.10/3.11 — backslash
-#                 interdit dans expression f-string {…}. Variable intermédiaire
-#                 fallback_text extraite avant la f-string.
-#   MAIN-53-FIX2  logger.debug → logger.warning pour MAIN-52-FIX1 (visible INFO)
+# v3.53 :
+#   MAIN-53-FIX1  SyntaxError Python 3.10/3.11 — variable intermédiaire
+#                 fallback_text extraite avant la f-string
+#   MAIN-53-FIX2  logger.debug → logger.warning pour MAIN-52-FIX1
 #
-# v3.54 — Finitions post-audit final :
-#   MAIN-54-FIX1  from __future__ import annotations — type hints Python 3.10 propres
+# v3.54 :
+#   MAIN-54-FIX1  from __future__ import annotations
 #   MAIN-54-FIX2  date_obj_monthly extrait en tête de run_monthly_report()
-#                 (était recalculé inline dans build_html_report — double appel)
 #   MAIN-54-FIX3  _maybe_export_csv() : guard hasattr(SentinelDB, "export_csv")
-#                 avant l'appel — évite AttributeError si la méthode est absente
-#                 de db_manager.py (méthode optionnelle non listée dans _check_dependencies)
 #   MAIN-54-FIX4  _OPTIONAL_MODULES vérifiés une seule fois via _check_optional_modules()
-#                 appelé uniquement dans main() et non à chaque _check_dependencies()
-#                 (évite les logs redondants sur le rapport mensuel)
 #
-# Corrections NON appliquées dans ce fichier (à corriger dans les modules concernés) :
-#   BUG-DB-1   : github_days_back absent du DDL et _ALLOWED_METRIC_COLS → db_manager.py
-#   BUG-MAIL-1 : regex d et s non échappés → mailer.py
-#   BUG-HC-1   : datetime.now() naïf → health_check.py
+# v3.60 — Audit complet inter-scripts (corrections audit 2026-04) :
+#
+#   MAIN-60-FIX1  BUG-CRIT-1 CORRIGÉ : double savemetrics() éliminé.
+#                 run_sentinel() appelé avec save_metrics=False dans main().
+#                 L'appel extract_metrics_from_report(report_text, date_iso)
+#                 qui suit dans main() est la SEULE source de savemetrics().
+#                 Avant : run_sentinel() appelait savemetrics() EN PLUS de l'appel
+#                 explicite dans main() → double écriture silencieuse en DB.
+#
+#   MAIN-60-FIX2  BUG-CRIT-2 CORRIGÉ : double extract_memory_delta() éliminé.
+#                 memory_deltas capturés depuis run_sentinel() (plus "_").
+#                 _process_report_data_to_db() reçoit memory_deltas en paramètre
+#                 et n'appelle PLUS extract_memory_delta(report_text) en interne.
+#                 Avant : les deltas retournés par run_sentinel() étaient ignorés
+#                 ("_"), puis recalculés dans _process_report_data_to_db().
+#
+#   MAIN-60-FIX3  Chemins absolus : _PROJECT_ROOT via Path(__file__).resolve().parent.
+#                 _GITHUB_LAST_RUN_PATH + mkdir() + log file en chemin absolu.
+#                 Avant : Path("data/...") — relatif au CWD, invalide en cron.
+#
+#   MAIN-60-FIX4  run_monthly_report() : capture memory_deltas depuis
+#                 run_sentinel_monthly() (était ignoré avec "_") et les sauvegarde
+#                 en DB (tendances + alertes du rapport mensuel enfin persistées).
+#
+#   MAIN-60-FIX5  datetime.now(timezone.utc) systématique — élimine datetime.now()
+#                 naïf dans _ensure_health_server() (ts du healthcheck UTC).
+#
+#   MAIN-60-FIX6  extract_memory_delta retiré des imports directs depuis sentinel_api.
+#                 Les memory_deltas sont désormais retournés par run_sentinel() et
+#                 passés en paramètre à _process_report_data_to_db().
+#
+#   MAIN-60-FIX7  _process_report_data_to_db() signature étendue :
+#                 memory_deltas: dict | None = None
+#                 Si fourni → utilisé directement. Si None → fallback
+#                 extract_memory_delta(report_text) conservé pour rétrocompatibilité.
 # =============================================================================
 
 from __future__ import annotations  # MAIN-54-FIX1
@@ -53,9 +78,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & VERSION
+# CONFIGURATION & VERSION — MAIN-60-FIX3 : chemins absolus
 # ---------------------------------------------------------------------------
-VERSION      = "3.54"
+VERSION      = "3.60"
 SONNET_MODEL = os.environ.get("SENTINEL_MODEL", "claude-sonnet-4-6")
 
 REPORT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RETENTION_DAYS",  "30"))
@@ -63,11 +88,13 @@ GITHUB_COOLDOWN_DAYS  = int(os.environ.get("GITHUB_COOLDOWN_DAYS",     "7"))
 GITHUB_MAX_LOOKBACK   = int(os.environ.get("GITHUB_MAX_LOOKBACK",      "21"))
 DAYS_BACK_CFG         = int(os.environ.get("GITHUB_DAYS_BACK",         "7"))
 MAX_CONTRACTS         = int(os.environ.get("SENTINEL_MAX_CONTRACTS",   "50"))
-_GITHUB_LAST_RUN_PATH = Path("data/github_last_run.txt")
+
+# MAIN-60-FIX3 : chemin absolu — Path("data/...") invalide en cron
+_PROJECT_ROOT         = Path(__file__).resolve().parent
+_GITHUB_LAST_RUN_PATH = _PROJECT_ROOT / "data" / "github_last_run.txt"
 
 for _d in ["logs", "data", "output", "backups"]:
-    Path(_d).mkdir(exist_ok=True)
-
+    (_PROJECT_ROOT / _d).mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # LOGGING INDUSTRIEL
@@ -82,18 +109,19 @@ def init_logging() -> None:
         ),
         datefmt="%Y-%m-%dT%H:%M:%S",
         handlers=[
-            logging.FileHandler("logs/sentinel.log", encoding="utf-8"),
+            logging.FileHandler(
+                str(_PROJECT_ROOT / "logs" / "sentinel.log"),  # MAIN-60-FIX3
+                encoding="utf-8",
+            ),
             logging.StreamHandler(),
         ],
     )
 
-
 init_logging()
 logger = logging.getLogger("SENTINEL")
 
-
 # ---------------------------------------------------------------------------
-# DÉCLENCHEMENT GITHUB — MAIN-46-A → MAIN-47-A → MAIN-52-FIX3
+# DÉCLENCHEMENT GITHUB — MAIN-52-FIX3
 # ---------------------------------------------------------------------------
 def _should_run_github() -> tuple[bool, int, str | None]:
     """
@@ -101,6 +129,7 @@ def _should_run_github() -> tuple[bool, int, str | None]:
 
     [MAIN-52-FIX3] Lecture unique du fichier — élimine la double lecture
     et la race condition théorique du pipeline v3.51.
+    [MAIN-60-FIX3] _GITHUB_LAST_RUN_PATH absolu.
 
     Logique :
         1. Lit data/github_last_run.txt une seule fois
@@ -140,7 +169,6 @@ def _should_run_github() -> tuple[bool, int, str | None]:
         )
         return today.weekday() == 4, DAYS_BACK_CFG, None
 
-
 def _mark_github_ran() -> None:
     """Écriture atomique .tmp → replace. Appelé après scrape réussi."""
     today = datetime.date.today().isoformat()
@@ -152,7 +180,6 @@ def _mark_github_ran() -> None:
     except OSError as e:
         logger.warning(f"GITHUB _mark_github_ran: écriture impossible ({e})")
 
-
 # ---------------------------------------------------------------------------
 # VALIDATION DES DÉPENDANCES — MAIN-44-FIX2
 # ---------------------------------------------------------------------------
@@ -163,7 +190,8 @@ _REQUIRED_DAILY: list[tuple[str, str]] = [
     ("memory_manager", "update_memory"),
     ("sentinel_api",   "run_sentinel"),
     ("sentinel_api",   "extract_metrics_from_report"),
-    ("sentinel_api",   "extract_memory_delta"),
+    # MAIN-60-FIX6 : extract_memory_delta retiré — n'est plus appelé en double
+    # depuis main(). Accessible via sentinel_api.extract_memory_delta si besoin.
     ("charts",         "generate_all_charts"),
     ("report_builder", "build_html_report"),
     ("report_builder", "purge_old_reports"),
@@ -183,7 +211,6 @@ _OPTIONAL_MODULES: list[tuple[str, str]] = [
     ("nlp_scorer", "run_nlp_pipeline"),
 ]
 
-
 def _check_dependencies(
     extra: list[tuple[str, str]] | None = None,
 ) -> list[str]:
@@ -202,7 +229,6 @@ def _check_dependencies(
         except ImportError:
             missing.append(f"{module_name} (module absent)")
     return missing
-
 
 def _check_optional_modules() -> None:
     """
@@ -225,7 +251,6 @@ def _check_optional_modules() -> None:
                 f"(pip install scikit-learn numpy) — NLP rerank désactivé"
             )
 
-
 # ---------------------------------------------------------------------------
 # TIMING PAR MODULE — MAIN-43-FIX1
 # ---------------------------------------------------------------------------
@@ -236,18 +261,17 @@ def _timed(label: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
     logger.info(f"TIMING {label} : {elapsed:.1f}s")
     return result
 
-
 # ---------------------------------------------------------------------------
-# HEALTH SERVER — MAIN-52-FIX7 : lock threading
+# HEALTH SERVER — MAIN-52-FIX7 / MAIN-60-FIX5
 # ---------------------------------------------------------------------------
 _HEALTH_SERVER_STARTED = False
 _HEALTH_LOCK           = threading.Lock()
-
 
 def _ensure_health_server() -> None:
     """
     Démarre le serveur HTTP de healthcheck en thread daemon.
     Protégé par un lock pour éviter un double démarrage théorique.
+    MAIN-60-FIX5 : datetime.now(timezone.utc) — ts UTC dans la réponse JSON.
     """
     global _HEALTH_SERVER_STARTED
     with _HEALTH_LOCK:
@@ -272,7 +296,10 @@ def _ensure_health_server() -> None:
                         json.dumps({
                             "status":  "ok",
                             "version": VERSION,
-                            "ts":      datetime.datetime.now().isoformat(),
+                            # MAIN-60-FIX5 : UTC — jamais datetime naïf
+                            "ts": datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
                         }).encode()
                     )
                 else:
@@ -292,7 +319,6 @@ def _ensure_health_server() -> None:
         _HEALTH_SERVER_STARTED = True
         logger.info(f"Health server actif sur port {port}")
 
-
 # ---------------------------------------------------------------------------
 # IMPORTS DES MODULES SENTINEL
 # ---------------------------------------------------------------------------
@@ -301,7 +327,9 @@ from memory_manager import get_compressed_memory, update_memory           # noqa
 from sentinel_api   import (                                               # noqa: E402
     run_sentinel,
     extract_metrics_from_report,
-    extract_memory_delta,
+    # MAIN-60-FIX6 : extract_memory_delta retiré des imports directs.
+    # Les memory_deltas sont désormais retournés par run_sentinel() et
+    # passés en paramètre à _process_report_data_to_db(). Plus de double appel.
 )
 from charts         import generate_all_charts                             # noqa: E402
 from report_builder import build_html_report, purge_old_reports            # noqa: E402
@@ -309,16 +337,17 @@ from mailer         import send_report                                     # noq
 from db_manager     import SentinelDB, closedb, initdb                     # noqa: E402
 from samgov_scraper import run_all_procurement                             # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # SCRAPERS OPTIONNELS — MAIN-41-FIX4
 # ---------------------------------------------------------------------------
 def _load_optional_scraper(name: str, module_path: str) -> Any:
-    if Path(module_path).exists():
+    """Charge un scraper optionnel depuis son chemin fichier."""
+    full_path = _PROJECT_ROOT / module_path   # MAIN-60-FIX3 : chemin absolu
+    if full_path.exists():
         try:
-            spec = ilu.spec_from_file_location(name, module_path)
+            spec = ilu.spec_from_file_location(name, str(full_path))
             if spec is None or spec.loader is None:
-                raise ImportError(f"Spec introuvable pour {module_path}")
+                raise ImportError(f"Spec introuvable pour {full_path}")
             mod = ilu.module_from_spec(spec)
             spec.loader.exec_module(mod)  # type: ignore[union-attr]
             return mod
@@ -326,30 +355,29 @@ def _load_optional_scraper(name: str, module_path: str) -> Any:
             logger.warning(f"Erreur chargement {name}: {e}")
     return None
 
-
 telegram_mod = _load_optional_scraper("telegram_scraper", "telegram_scraper.py")
 patents_mod  = _load_optional_scraper("ops_patents",       "ops_patents.py")
 github_mod   = _load_optional_scraper("github_scraper",    "github_scraper.py")
 
-
 # ---------------------------------------------------------------------------
-# LOGIQUE DE SAUVEGARDE (Centralisée)
+# LOGIQUE DE SAUVEGARDE — MAIN-60-FIX2 / MAIN-60-FIX7
 # ---------------------------------------------------------------------------
 def _process_report_data_to_db(
     report_text:      str,
     metrics:          dict,
     date_iso:         str,
-    github_days_back: int = 0,
+    github_days_back: int        = 0,
+    memory_deltas:    dict | None = None,   # MAIN-60-FIX7 : nouveau paramètre
 ) -> None:
     """
     Sauvegarde métriques, rapport, tendances et alertes dans SentinelDB.
 
     [MAIN-48-B]    github_days_back : 0 = pas de GitHub, >0 = fenêtre effective.
     [MAIN-52-FIX1] Log WARNING si github_days_back risque d'être rejeté par DB.
-                   Correction définitive requise dans db_manager.py :
-                   ajouter "github_days_back" dans _ALLOWED_METRIC_COLS et le DDL.
-    [MAIN-52-FIX2] deltas = extract_memory_delta(...) or {} — guard contre None.
-    [MAIN-51-FIX2] compressed = texte Claude complet (phase MAP mensuelle).
+    [MAIN-60-FIX2] BUG-CRIT-2 CORRIGÉ : memory_deltas reçu en paramètre depuis
+                   run_sentinel() — plus de double extract_memory_delta().
+    [MAIN-60-FIX7] Fallback extract_memory_delta(report_text) conservé si
+                   memory_deltas=None pour rétrocompatibilité (appels directs).
     """
     if github_days_back > 0:
         logger.warning(
@@ -373,11 +401,23 @@ def _process_report_data_to_db(
         date       = date_iso,
         indice     = metrics.get("indice", 5.0),
         alerte     = metrics.get("alerte", "VERT"),
-        compressed = report_text,        # texte Claude complet — phase MAP mensuelle
-        rawtail    = report_text[:3000],  # troncature — requêtes rapides dashboard
+        compressed = report_text,        # texte Claude complet
+        rawtail    = report_text[:3000], # troncature — requêtes rapides dashboard
     )
 
-    deltas = extract_memory_delta(report_text) or {}  # MAIN-52-FIX2
+    # MAIN-60-FIX2 : utiliser les deltas déjà extraits — éviter le double appel.
+    # Si memory_deltas=None (appel legacy direct), fallback vers l'extraction locale.
+    if memory_deltas is None:
+        # Fallback rétrocompatibilité — ne devrait plus être atteint depuis main()
+        from sentinel_api import extract_memory_delta as _extract_delta
+        deltas = _extract_delta(report_text) or {}
+        logger.debug(
+            "_process_report_data_to_db : memory_deltas=None — "
+            "fallback extract_memory_delta() (appel legacy)"
+        )
+    else:
+        deltas = memory_deltas
+
     for t in deltas.get("nouvelles_tendances", []):
         SentinelDB.savetendance(t, date_iso)
     for a in deltas.get("alertes_ouvertes", []):
@@ -385,9 +425,8 @@ def _process_report_data_to_db(
     for c in deltas.get("alertes_closes", []):
         SentinelDB.closealerte(c, date_iso)
 
-
 # ---------------------------------------------------------------------------
-# EXPORT CSV OPTIONNEL
+# EXPORT CSV OPTIONNEL — MAIN-54-FIX3
 # ---------------------------------------------------------------------------
 def _maybe_export_csv() -> dict:
     """
@@ -412,9 +451,8 @@ def _maybe_export_csv() -> dict:
         logger.warning(f"Export CSV non bloquant : {e}")
         return {}
 
-
 # ---------------------------------------------------------------------------
-# PIPELINE QUOTIDIEN
+# PIPELINE QUOTIDIEN — MAIN-60-FIX1 / MAIN-60-FIX2
 # ---------------------------------------------------------------------------
 def main() -> None:
     logger.info(f"=== DEMARRAGE SENTINEL v{VERSION} ===")
@@ -448,7 +486,7 @@ def main() -> None:
 
         # [MAIN-52-FIX5] Cap contrats pour éviter overflow tokens
         try:
-            contracts = _timed("procurement", run_all_procurement, daysback=2)
+            contracts        = _timed("procurement", run_all_procurement, daysback=2)
             contracts_capped = (contracts or [])[:MAX_CONTRACTS]
             if len(contracts or []) > MAX_CONTRACTS:
                 logger.warning(
@@ -461,7 +499,7 @@ def main() -> None:
             logger.warning(f"Erreur Procurement (non bloquant) : {e}")
 
         # ── GitHub — MAIN-52-FIX3 : une seule lecture fichier ────────────────
-        has_github:     bool      = False
+        has_github:     bool       = False
         last_run_iso:   str | None = None
         effective_days: int        = DAYS_BACK_CFG
 
@@ -526,29 +564,35 @@ def main() -> None:
         report_type = "friday_rd" if has_github else "daily"
         logger.info(f"CLAUDE report_type={report_type!r}")
 
-        report_text, _ = _timed(
+        # ── MAIN-60-FIX1 : save_metrics=False — évite le double savemetrics()
+        # ── MAIN-60-FIX2 : capturer memory_deltas (plus "_")
+        report_text, memory_deltas = _timed(
             "claude_daily",
             run_sentinel,
             formatted_data,
             memory_context,
             date_obj,
-            model       = SONNET_MODEL,
-            report_type = report_type,
+            model        = SONNET_MODEL,
+            report_type  = report_type,
+            save_metrics = False,   # MAIN-60-FIX1 : seul appel save ci-dessous
         )
         if not report_text:
             raise RuntimeError("Claude n'a retourné aucun rapport.")
 
         # ── 3. EXTRACTION & DB ───────────────────────────────────────────────
-        metrics = extract_metrics_from_report(report_text, date_iso)
+        # MAIN-60-FIX1 : extract_metrics_from_report() = SEULE source de savemetrics()
+        metrics = extract_metrics_from_report(report_text, date_iso)  # save=True défaut
+
+        # MAIN-60-FIX2 : memory_deltas passés en paramètre — plus de double extraction
         _process_report_data_to_db(
             report_text,
             metrics or {},
             date_iso,
-            github_days_back=effective_days if has_github else 0,
+            github_days_back = effective_days if has_github else 0,
+            memory_deltas    = memory_deltas,   # MAIN-60-FIX2
         )
 
         # ── 4. RESTITUTION ───────────────────────────────────────────────────
-        # chart_dict peut être un dict {nom: path} ou une list — on normalise
         chart_dict  = _timed("charts", generate_all_charts, report_text)
         chart_paths = (
             list(chart_dict.values()) if isinstance(chart_dict, dict)
@@ -590,9 +634,8 @@ def main() -> None:
     finally:
         closedb()
 
-
 # ---------------------------------------------------------------------------
-# RAPPORT MENSUEL
+# RAPPORT MENSUEL — MAIN-60-FIX4
 # ---------------------------------------------------------------------------
 def run_monthly_report() -> None:
     """
@@ -604,6 +647,7 @@ def run_monthly_report() -> None:
     [MAIN-54-FIX2] date_obj_monthly extrait en tête de fonction (unique calcul).
     [MAIN-52-FIX4] Guard "if not filled" avant REDUCE.
     [MAIN-53-FIX1] fallback_text en variable intermédiaire (pas de backslash en f-string).
+    [MAIN-60-FIX4] memory_deltas capturés depuis run_sentinel_monthly() et persistés.
     """
     logger.info(f"=== DEMARRAGE RAPPORT MENSUEL SENTINEL v{VERSION} ===")
     start_time = timeperf.perf_counter()
@@ -651,8 +695,6 @@ def run_monthly_report() -> None:
         logger.info(f"MapReduce mensuel : {len(rows)} rapports récupérés")
 
         # ── Phase MAP parallèle ───────────────────────────────────────────
-        # compressed en priorité (texte Claude complet depuis v3.52),
-        # rawtail en fallback (anciens rapports pré-v3.51)
         raw_texts: list[str] = [
             (row.get("compressed") or row.get("rawtail") or "").strip()
             for row in rows
@@ -716,7 +758,7 @@ def run_monthly_report() -> None:
 
         weekly_summaries: list[str]                    = []
         catchup_weeks:    list[tuple[int, int, float]] = []
-        chunks = _chunk(filled, 7)  # calculé une seule fois
+        chunks = _chunk(filled, 7)
 
         for w_idx, week in enumerate(chunks, 1):
             week_texts = [s for s, _ in week]
@@ -867,8 +909,8 @@ def run_monthly_report() -> None:
             f"({len(injection)} chars → Sonnet)"
         )
 
-        # ── Synthèse Sonnet finale ────────────────────────────────────────
-        report_text, _ = _timed(
+        # ── Synthèse Sonnet finale — MAIN-60-FIX4 : capture memory_deltas ─────
+        report_text, memory_deltas_monthly = _timed(
             "claude_monthly",
             run_sentinel_monthly,
             injection,
@@ -901,6 +943,23 @@ def run_monthly_report() -> None:
             compressed = report_text,   # texte mensuel brut
             rawtail    = monthly_meta,  # JSON métadonnées audit
         )
+
+        # MAIN-60-FIX4 : persister les deltas mémoire du rapport mensuel
+        if any(memory_deltas_monthly.values()):
+            for t in memory_deltas_monthly.get("nouvelles_tendances", []):
+                SentinelDB.savetendance(t, date_iso)
+            for a in memory_deltas_monthly.get("alertes_ouvertes", []):
+                SentinelDB.ouvrirealerte(a, date_iso)
+            for c in memory_deltas_monthly.get("alertes_closes", []):
+                SentinelDB.closealerte(c, date_iso)
+            logger.info(
+                f"MONTHLY Deltas mémoire persistés : "
+                f"{len(memory_deltas_monthly['nouvelles_tendances'])} tendances, "
+                f"{len(memory_deltas_monthly['alertes_ouvertes'])} alertes ouvertes, "
+                f"{len(memory_deltas_monthly['alertes_closes'])} alertes closes"
+            )
+        else:
+            logger.debug("MONTHLY Aucun delta mémoire dans le rapport mensuel")
 
         chart_dict_monthly  = _timed("charts_monthly", generate_all_charts, report_text)
         chart_paths_monthly = (
@@ -944,12 +1003,11 @@ def run_monthly_report() -> None:
     finally:
         closedb()
 
-
 # ---------------------------------------------------------------------------
 # ENTRÉE PRINCIPALE
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    TODAY = datetime.date.today()
+    TODAY = datetime.datetime.now(datetime.timezone.utc).date()  # MAIN-60-FIX5
     if TODAY.day == 1:
         try:
             run_monthly_report()
