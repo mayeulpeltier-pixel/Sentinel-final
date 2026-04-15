@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# watchdog.py — SENTINEL v3.43 — Surveillance cron & auto-recovery
+# watchdog.py — SENTINEL v3.60 — Surveillance cron & auto-recovery
 # ─────────────────────────────────────────────────────────────────────────────
 # Corrections v3.40 :
 # WD-FIX1  — logging structuré (zéro print())
@@ -17,14 +17,12 @@
 # WD-FIX13 — exit code 0=OK / 1=warning / 2=critique
 # WD-FIX14 — vérification output/ dernier HTML généré
 # WD-FIX15 — détection process zombie (sentinel_main bloqué)
-#
-# Corrections v3.43 :
 # WD-FIX16 — parsing log JSON structuré (format {"ts":...,"msg":...})
 # WD-FIX17 — tokens succès : "CYCLE TERMINE EN" / "RAPPORT MENSUEL TERMINE EN"
 # WD-FIX18 — datetime naive/aware unifiés → timezone.utc partout
 # WD-FIX19 — open() sans close() dans auto_restart_pipeline() corrigé
 # WD-FIX20 — glob pattern corrigé : "SENTINEL_*.html"
-# WD-FIX21 — VERSION synchronisée à 3.43
+# WD-FIX21 — VERSION synchronisée
 # WD-FIX22 — annotation retour _build_alert_email : tuple[str,str,str]
 # WD-FIX23 — seuil zombie étendu à 180 min le 1er du mois
 # WD-FIX24 — compteurs _warnings/_critiques réinitialisés en début run
@@ -32,37 +30,29 @@
 # WD-FIX26 — log explicite après rotation (évite faux positif)
 # WD-FIX27 — purge output/ renommée _purge_output_files()
 # WD-FIX28 — exit_code sauvegardé dans state["runs"]
-#
-# Corrections v3.43-rev1 :
 # WD-FIX29 — json.loads isolé : except JSONDecodeError/UnicodeDecodeError
 # WD-FIX30 — _tail_lines() via collections.deque (sans charger le fichier en RAM)
-#
-# Corrections v3.43-rev2 :
 # WD-FIX31 — SQLite en lecture seule (uri=True, mode=ro)
 # WD-FIX32 — ssl.create_default_context() sur starttls() (anti-MITM)
 # WD-FIX33 — SENTINEL_NO_ROTATE=1 désactive la rotation interne
-#
-# Corrections v3.43-win (compatibilité Windows/WSL2) :
-# WD-FIX34 — psutil remplace pgrep + /proc : cross-platform (Linux/macOS/Windows)
+# WD-FIX34 — psutil remplace pgrep + /proc : cross-platform
 # WD-FIX35 — DETACHED_PROCESS + CREATE_NO_WINDOW sur Windows
 # WD-FIX36 — pythonw.exe sur Windows (pas de fenêtre console)
+#
+# Corrections v3.60 — Audit inter-scripts 2026-04 :
+# WD-60-FIX1  — Import config.py centralisé (VERSION, SMTP_PASS, TOKENS_SUCCES…)
+#               SMTP_PASS lit maintenant SMTP_PASS/SMTP_PASSWORD/GMAIL_APP_PASSWORD
+# WD-60-FIX2  — VERSION synchronisée sur VERSION du projet (3.60)
+# WD-60-FIX3  — _build_alert_email() : datetime.now() → datetime.now(timezone.utc)
+# WD-60-FIX4  — send_daily_summary() : datetime.now() → datetime.now(timezone.utc)
+# WD-60-FIX5  — TOKENS_SUCCES importés depuis config.py (alignés v3.60)
+# WD-60-FIX6  — Chemins absolus via config.PROJECT_ROOT
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage :
 #   python watchdog.py               Vérification complète
 #   python watchdog.py --restart     Auto-restart si pipeline mort
 #   python watchdog.py --summary     Force l'envoi du résumé quotidien
 #   python watchdog.py --rotate-logs Force la rotation des logs
-# ─────────────────────────────────────────────────────────────────────────────
-# Planification recommandée :
-#   Linux/macOS/WSL2 (cron) :
-#     0  6  * * * cd ~/sentinel && python3 sentinel_main.py >> logs/sentinel.log 2>&1
-#     30 6  * * * cd ~/sentinel && python3 watchdog.py >> logs/watchdog.log 2>&1
-#     30 8  * * * cd ~/sentinel && python3 watchdog.py --summary >> logs/watchdog.log 2>&1
-#
-#   Windows natif (Task Scheduler) :
-#     schtasks /create /tn "SentinelMain"     /tr "python C:sentinelsentinel_main.py" /sc daily /st 06:00
-#     schtasks /create /tn "SentinelWatchdog" /tr "python C:sentinelwatchdog.py"      /sc daily /st 06:30
-#     schtasks /create /tn "SentinelSummary"  /tr "python C:sentinelwatchdog.py --summary" /sc daily /st 08:30
 # ─────────────────────────────────────────────────────────────────────────────
 # Codes de sortie :
 #   0 — Pipeline OK
@@ -99,12 +89,18 @@ try:
 except ImportError:
     _PSUTIL_AVAILABLE = False
 
-# ── Charger .env si disponible ────────────────────────────────────────────────
+# ── Charger .env + config central (WD-60-FIX1) ───────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+try:
+    import config as _cfg
+    _CONFIG_AVAILABLE = True
+except ImportError:
+    _CONFIG_AVAILABLE = False
 
 # ── Python ≥ 3.10 (WD-FIX2) ──────────────────────────────────────────────────
 if sys.version_info < (3, 10):
@@ -124,12 +120,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("sentinel.watchdog")
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# CONSTANTES & CONFIGURATION
+# CONSTANTES & CONFIGURATION — WD-60-FIX1/2/5/6
 # ═════════════════════════════════════════════════════════════════════════════
 
-VERSION = "3.43"
+# WD-60-FIX2 : VERSION depuis config.py (source unique)
+VERSION = _cfg.VERSION if _CONFIG_AVAILABLE else "3.60"
 
 # Seuils temporels
 SEUIL_H_ALERTE = int(os.environ.get("SENTINEL_MAX_SILENCE", "26"))
@@ -139,47 +135,64 @@ LOG_MAX_MB     = 50
 DISK_CRIT_MB   = 200
 DISK_WARN_MB   = 500
 
-# WD-FIX17 — tokens alignés sur sentinel_main.py v3.43
-TOKENS_SUCCES = ("CYCLE TERMINE EN", "RAPPORT MENSUEL TERMINE EN")
+# WD-60-FIX5 : TOKENS_SUCCES depuis config.py — alignés sur sentinel_main.py v3.60
+TOKENS_SUCCES = _cfg.TOKENS_SUCCES if _CONFIG_AVAILABLE else (
+    "CYCLE TERMINE EN", "RAPPORT MENSUEL TERMINE EN"
+)
 
-# Chemins
-LOGFILE    = Path(os.environ.get("SENTINEL_LOG", "logs/sentinel.log"))
-STATE_FILE = Path("logs/watchdog_state.json")
-DB_PATH    = Path(os.environ.get("SENTINEL_DB", "data/sentinel.db"))
-OUTPUT_DIR = Path("output")
+# WD-60-FIX6 : Chemins absolus
+if _CONFIG_AVAILABLE:
+    _PROJECT_ROOT = _cfg.PROJECT_ROOT
+    LOGFILE       = _cfg.SENTINEL_LOG
+    DB_PATH       = _cfg.DB_PATH
+else:
+    _PROJECT_ROOT = Path(__file__).resolve().parent
+    LOGFILE       = Path(os.environ.get("SENTINEL_LOG", "logs/sentinel.log"))
+    DB_PATH       = Path(os.environ.get("SENTINEL_DB",  "data/sentinel.db"))
 
-# SMTP
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "") or os.environ.get("SMTP_PASSWORD", "")
-ALERT_TO  = os.environ.get("REPORT_EMAIL", SMTP_USER)
+STATE_FILE = _PROJECT_ROOT / "logs" / "watchdog_state.json"
+OUTPUT_DIR = _PROJECT_ROOT / "output"
+
+# WD-60-FIX1 : SMTP depuis config.py (gère les 3 noms de variable)
+if _CONFIG_AVAILABLE:
+    SMTP_HOST = _cfg.SMTP_HOST
+    SMTP_PORT = _cfg.SMTP_PORT
+    SMTP_USER = _cfg.SMTP_USER
+    SMTP_PASS = _cfg.SMTP_PASS
+    ALERT_TO  = _cfg.REPORT_EMAIL
+else:
+    SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+    SMTP_USER = os.environ.get("SMTP_USER", "")
+    SMTP_PASS = (
+        os.environ.get("SMTP_PASS")
+        or os.environ.get("SMTP_PASSWORD")
+        or os.environ.get("GMAIL_APP_PASSWORD")
+        or ""
+    )
+    ALERT_TO = os.environ.get("REPORT_EMAIL", SMTP_USER)
 
 # Health endpoint (WD-FIX25)
 HEALTH_PORT = int(os.environ.get("SENTINEL_HEALTH_PORT", "8765"))
 
 # WD-FIX33 — désactive rotation interne si logrotate est actif
-# Usage : SENTINEL_NO_ROTATE=1 python watchdog.py
 DISABLE_INTERNAL_ROTATION = os.environ.get("SENTINEL_NO_ROTATE", "0") == "1"
 
 # Flags CLI
-AUTO_RESTART  = "--restart"      in sys.argv
-FORCE_SUMMARY = "--summary"      in sys.argv
-FORCE_ROTATE  = "--rotate-logs"  in sys.argv
+AUTO_RESTART  = "--restart"     in sys.argv
+FORCE_SUMMARY = "--summary"     in sys.argv
+FORCE_ROTATE  = "--rotate-logs" in sys.argv
 
 # Compteurs — réinitialisés dans run_watchdog() (WD-FIX24)
 _warnings  = 0
 _critiques = 0
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # UTILITAIRE — Lecture des N dernières lignes sans charger le fichier en RAM
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _tail_lines(path: Path, n: int = 2000) -> list[str]:
-    """
-    WD-FIX30 — collections.deque : évite d'allouer ~50 MB pour 2000 lignes.
-    """
+    """WD-FIX30 — collections.deque : évite d'allouer ~50 MB pour 2000 lignes."""
     try:
         with open(path, "rb") as f:
             dq = collections.deque(f, maxlen=n)
@@ -187,7 +200,6 @@ def _tail_lines(path: Path, n: int = 2000) -> list[str]:
     except OSError as e:
         log.warning(f"_tail_lines : impossible de lire {path} : {e}")
         return []
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ÉTAT PERSISTANT (WD-FIX4 / WD-FIX9)
@@ -201,17 +213,15 @@ def _load_state() -> dict[str, Any]:
             pass
     return {"last_alert": {}, "last_summary": None, "runs": []}
 
-
 def _save_state(state: dict[str, Any]) -> None:
     """Sauvegarde atomique (write-then-rename)."""
-    Path("logs").mkdir(exist_ok=True)
+    STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(STATE_FILE)
     except OSError as e:
         log.warning(f"Impossible de sauvegarder l'état watchdog : {e}")
-
 
 def _can_send_alert(state: dict, alert_key: str) -> bool:
     """WD-FIX4 — Anti-spam : 1 alerte max par tranche de ANTI_SPAM_H heures."""
@@ -226,10 +236,9 @@ def _can_send_alert(state: dict, alert_key: str) -> bool:
     except ValueError:
         return True
 
-
 def _mark_alert_sent(state: dict, alert_key: str) -> None:
+    # WD-60-FIX3 : datetime.now(timezone.utc) — plus jamais naïf
     state.setdefault("last_alert", {})[alert_key] = datetime.now(timezone.utc).isoformat()
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENVOI EMAIL (WD-FIX5 — retry exponentiel + WD-FIX32 — SSL strict)
@@ -244,7 +253,7 @@ def send_alert(subject: str, body: str, html_body: str = "") -> bool:
         log.warning(f"Email non configuré — alerte non envoyée : {subject}")
         return False
 
-    msg = MIMEMultipart("alternative")
+    msg            = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = SMTP_USER
     msg["To"]      = ALERT_TO
@@ -252,27 +261,34 @@ def send_alert(subject: str, body: str, html_body: str = "") -> bool:
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    # WD-FIX5 : 3 délais de retry
+    delays = [30, 60, 120]
     for attempt in range(3):
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-                server.ehlo()
-                server.starttls(context=ssl.create_default_context())  # WD-FIX32
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(SMTP_USER, ALERT_TO.split(","), msg.as_string())
+            if SMTP_PORT == 465:
+                ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=30) as server:
+                    server.login(SMTP_USER, SMTP_PASS)
+                    server.sendmail(SMTP_USER, ALERT_TO.split(","), msg.as_string())
+            else:
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls(context=ssl.create_default_context())  # WD-FIX32
+                    server.login(SMTP_USER, SMTP_PASS)
+                    server.sendmail(SMTP_USER, ALERT_TO.split(","), msg.as_string())
             log.info(f"Email envoyé → {ALERT_TO} | {subject}")
             return True
         except smtplib.SMTPAuthenticationError as e:
             log.error(f"SMTP auth échouée (tentative {attempt + 1}/3) : {e}")
             break
         except (smtplib.SMTPException, OSError) as e:
-            delay = 30 * (2 ** attempt)
+            delay = delays[attempt]
             log.warning(f"SMTP tentative {attempt + 1}/3 échouée : {e} — retry dans {delay}s")
             if attempt < 2:
                 time.sleep(delay)
 
     log.error(f"SMTP : 3 tentatives épuisées — alerte non envoyée : {subject}")
     return False
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # VÉRIFICATION 0 — Health endpoint HTTP (WD-FIX25 + WD-FIX29)
@@ -292,7 +308,6 @@ def check_health_endpoint() -> dict[str, Any]:
         with urllib.request.urlopen(url, timeout=3) as resp:
             raw = resp.read()
 
-        # WD-FIX29 — exceptions spécifiques, pas un except Exception générique
         try:
             data = json.loads(raw.decode("utf-8"))
         except UnicodeDecodeError as e:
@@ -324,7 +339,6 @@ def check_health_endpoint() -> dict[str, Any]:
 
     return result
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # VÉRIFICATION 1 — Dernier run pipeline (WD-FIX3/16/17/18/30)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -332,19 +346,20 @@ def check_health_endpoint() -> dict[str, Any]:
 def check_last_run() -> tuple[bool, float, str]:
     """
     WD-FIX3  — Triple source : log file + SQLite + health endpoint.
-    WD-FIX16 — Parsing format JSON structuré sentinel_main.py v3.43.
+    WD-FIX16 — Parsing format JSON structuré sentinel_main.py v3.60.
     WD-FIX17 — Tokens : "CYCLE TERMINE EN" / "RAPPORT MENSUEL TERMINE EN".
     WD-FIX18 — Toutes comparaisons datetime en UTC aware.
     WD-FIX30 — _tail_lines() sans charger le fichier entier.
     WD-FIX31 — SQLite en lecture seule (mode=ro).
+    WD-60-FIX5 — TOKENS_SUCCES depuis config (alignés v3.60).
     """
     global _warnings, _critiques
 
-    age_h_log: float        = float("inf")
-    age_h_db:  float        = float("inf")
+    age_h_log: float         = float("inf")
+    age_h_db:  float         = float("inf")
     last_dt_log: datetime | None = None
     last_dt_db:  datetime | None = None
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)  # WD-60-FIX3 : UTC systématique
 
     # ── Source 1 : log file ───────────────────────────────────────────────────
     if LOGFILE.exists():
@@ -367,194 +382,216 @@ def check_last_run() -> tuple[bool, float, str]:
 
     # ── Source 2 : SQLite (WD-FIX31 — lecture seule) ─────────────────────────
     if DB_PATH.exists():
+        conn = None
         try:
-            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
-            row  = conn.execute(
+            db_uri = DB_PATH.as_uri() + "?mode=ro"
+            conn   = sqlite3.connect(db_uri, uri=True, timeout=5)
+            row    = conn.execute(
                 "SELECT date FROM reports ORDER BY date DESC LIMIT 1"
             ).fetchone()
-            conn.close()
             if row:
                 last_dt_db = datetime.fromisoformat(row[0])
                 if last_dt_db.tzinfo is None:
                     last_dt_db = last_dt_db.replace(tzinfo=timezone.utc)
                 age_h_db = (now_utc - last_dt_db).total_seconds() / 3600
         except sqlite3.Error as e:
-            log.warning(f"SQLite lecture dernier rapport : {e}")
+            log.warning(f"SQLite check_last_run : {e}")
+        finally:
+            if conn:
+                conn.close()
 
-    # ── Décision : source la plus récente ─────────────────────────────────────
-    age_h   = min(age_h_log, age_h_db)
-    source  = "log" if age_h_log <= age_h_db else "SQLite"
-    last_dt = last_dt_log if age_h_log <= age_h_db else last_dt_db
+    # ── Source 3 : health endpoint ────────────────────────────────────────────
+    health = check_health_endpoint()
+
+    # ── Décision finale (on prend le plus récent des deux sources) ─────────────
+    age_h = min(age_h_log, age_h_db)
+    source = "log" if age_h_log <= age_h_db else "db"
 
     if age_h == float("inf"):
+        if health["ok"]:
+            log.info("Aucun run trouvé en log/DB mais health endpoint OK — pipeline récemment démarré")
+            return True, 0.0, "health_endpoint_ok"
         _critiques += 1
-        return False, age_h, "Aucun run réussi trouvé (log absent + DB vide)"
+        log.error("Aucun run trouvé (log + DB + health endpoint) — pipeline jamais exécuté ou vide")
+        return False, float("inf"), "no_run_found"
 
-    last_str = last_dt.strftime("%Y-%m-%d %H:%M") if last_dt else "inconnue"
+    detail = f"Dernier run il y a {age_h:.1f}h (source: {source})"
+    log.info(detail)
 
     if age_h > SEUIL_H_ALERTE:
         _critiques += 1
-        return (
-            False, age_h,
-            f"Pipeline mort depuis {age_h:.1f}h (seuil {SEUIL_H_ALERTE}h) "
-            f"— dernier run : {last_str} [{source}]"
-        )
+        log.error(f"Pipeline SILENCIEUX depuis {age_h:.1f}h > seuil {SEUIL_H_ALERTE}h")
+        return False, age_h, detail
     elif age_h > SEUIL_H_WARN:
         _warnings += 1
-        return (
-            False, age_h,
-            f"Pipeline silencieux depuis {age_h:.1f}h (warning > {SEUIL_H_WARN}h) "
-            f"— dernier run : {last_str} [{source}]"
-        )
-    else:
-        return True, age_h, f"Dernier run OK il y a {age_h:.1f}h [{source}] ✓"
+        log.warning(f"Pipeline silence {age_h:.1f}h > seuil warn {SEUIL_H_WARN}h")
+        return True, age_h, detail
 
+    return True, age_h, detail
 
 # ═════════════════════════════════════════════════════════════════════════════
-# VÉRIFICATION 2 — Santé SQLite (WD-FIX3 + WD-FIX31)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def check_sqlite_health() -> dict[str, Any]:
-    """WD-FIX3/31 — Intégrité SQLite en lecture seule, stats pour l'email."""
-    global _warnings, _critiques
-    result: dict[str, Any] = {"ok": True, "detail": ""}
-
-    if not DB_PATH.exists():
-        result.update(ok=True, detail="DB absente (1er déploiement)")
-        return result
-
-    try:
-        # WD-FIX31 — lecture seule : jamais bloquant pour sentinel_main.py
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
-
-        # WAL mode
-        jmode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-        if jmode.lower() != "wal":
-            log.warning(f"SQLite journal_mode = '{jmode}' (WAL attendu)")
-            _warnings += 1
-            result["journal_mode_warn"] = jmode
-
-        # Intégrité
-        ic = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        if ic != "ok":
-            _critiques += 1
-            result.update(ok=False, detail=f"CORRUPTION DB : {ic}")
-            log.error(f"SQLite CORRUPTION : {ic}")
-            conn.close()
-            return result
-
-        # Comptages
-        for table in ("reports", "seenhashes", "alertes", "tendances"):
-            try:
-                n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                result[f"n_{table}"] = n
-            except sqlite3.Error:
-                result[f"n_{table}"] = -1
-
-        # BUG-DB1 : UNIQUE sur reports.date
-        schema_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='reports' AND type='table'"
-        ).fetchone()
-        schema_sql = (schema_row[0] or "") if schema_row else ""
-        if "UNIQUE" not in schema_sql.upper():
-            _critiques += 1
-            result["bug_db1"] = True
-            log.error("SQLite BUG-DB1 : UNIQUE absent sur reports.date — UPSERT échouera")
-
-        result["size_kb"] = DB_PATH.stat().st_size // 1024
-        conn.close()
-        result.update(ok=True, detail=f"{result.get('n_reports', 0)} rapports")
-
-    except sqlite3.Error as e:
-        _critiques += 1
-        result.update(ok=False, detail=f"Erreur connexion SQLite : {e}")
-        log.error(f"SQLite connexion : {e}")
-
-    return result
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# VÉRIFICATION 3 — Espace disque (WD-FIX6)
+# VÉRIFICATION 2 — Espace disque (WD-FIX6)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def check_disk_space() -> dict[str, Any]:
-    global _warnings, _critiques
-    result: dict[str, Any] = {}
+    """WD-FIX6 — Vérification espace disque + estimation croissance."""
+    result: dict[str, Any] = {"ok": True, "free_mb": 0, "detail": ""}
     try:
-        usage   = shutil.disk_usage(".")
-        free_mb = usage.free // (1024 * 1024)
-        pct     = 100 * usage.used // usage.total
-        result  = {"free_mb": free_mb, "used_pct": pct, "ok": True}
+        usage    = shutil.disk_usage(str(_PROJECT_ROOT))
+        free_mb  = usage.free // (1024 * 1024)
+        total_mb = usage.total // (1024 * 1024)
+        used_pct = 100 * usage.used // usage.total
+
+        result["free_mb"] = free_mb
+        result["detail"]  = f"Disque : {free_mb} MB libre / {total_mb} MB ({used_pct}% utilisé)"
 
         if free_mb < DISK_CRIT_MB:
+            _critiques_count = globals().get("_critiques", 0)
+            global _critiques
             _critiques += 1
-            result["ok"] = False
-            log.error(f"DISQUE CRITIQUE : {free_mb} MB libres ({pct}% utilisé)")
+            result["ok"]  = False
+            result["level"] = "critical"
+            log.error(f"DISQUE CRITIQUE : {free_mb} MB < {DISK_CRIT_MB} MB")
         elif free_mb < DISK_WARN_MB:
+            global _warnings
             _warnings += 1
-            log.warning(f"Disque bas : {free_mb} MB libres ({pct}% utilisé)")
+            result["level"] = "warning"
+            log.warning(f"Disque bas : {free_mb} MB < {DISK_WARN_MB} MB")
         else:
-            log.info(f"Disque OK : {free_mb} MB libres ({pct}% utilisé) ✓")
+            result["level"] = "ok"
+            log.info(result["detail"])
+
     except OSError as e:
-        log.warning(f"Disque : impossible de vérifier : {e}")
-        result = {"free_mb": -1, "used_pct": -1, "ok": True}
+        result["detail"] = f"Impossible de vérifier l'espace disque : {e}"
+        log.warning(result["detail"])
     return result
 
+# ═════════════════════════════════════════════════════════════════════════════
+# VÉRIFICATION 3 — Base de données SQLite (WD-FIX3)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def check_sqlite_db() -> dict[str, Any]:
+    """
+    WD-FIX3  — SQLite comme 2e source de vérité.
+    WD-FIX31 — Lecture seule (mode=ro).
+    Vérifie intégrité, compte lignes, détecte BUG-DB-1 (UNIQUE absent).
+    """
+    result: dict[str, Any] = {"ok": False, "detail": "", "bugdb1": False}
+
+    if not DB_PATH.exists():
+        global _critiques
+        _critiques += 1
+        result["detail"] = f"Base de données absente : {DB_PATH}"
+        log.error(result["detail"])
+        return result
+
+    conn = None
+    try:
+        db_uri = DB_PATH.as_uri() + "?mode=ro"
+        conn   = sqlite3.connect(db_uri, uri=True, timeout=5)
+
+        # Intégrité
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity[0] != "ok":
+            _critiques += 1
+            result["detail"] = f"DB corrompue : {integrity[0]}"
+            log.error(result["detail"])
+            return result
+
+        # Comptes
+        counts = {}
+        for table in ("reports", "metrics", "seenhashes", "tendances", "alertes"):
+            try:
+                row           = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                counts[table] = row[0] if row else 0
+            except sqlite3.OperationalError:
+                counts[table] = -1  # table absente
+
+        # BUG-DB-1 : vérification UNIQUE sur reports.date
+        schema_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reports'"
+        ).fetchone()
+        if schema_sql and "UNIQUE" not in schema_sql[0].upper():
+            _critiques += 1
+            result["bugdb1"] = True
+            log.error(
+                "BUG-DB-1 : contrainte UNIQUE absente sur reports.date — "
+                "UPSERT échoue silencieusement → doublons possibles. "
+                "Corriger le DDL dans db_manager.py."
+            )
+
+        # Colonne github_days_back (HC-51-FIX5)
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(metrics)").fetchall()]
+            if "github_days_back" not in cols:
+                global _warnings
+                _warnings += 1
+                log.warning(
+                    "DB : colonne 'github_days_back' absente de 'metrics' — "
+                    "anti-biais GitHub inopérant. Lancer initdb() pour la migration."
+                )
+        except sqlite3.OperationalError:
+            pass
+
+        result["ok"]     = True
+        result["counts"] = counts
+        result["detail"] = f"DB OK — {counts}"
+        log.info(result["detail"])
+
+    except sqlite3.Error as e:
+        _critiques += 1
+        result["detail"] = f"Erreur SQLite : {e}"
+        log.error(result["detail"])
+    finally:
+        if conn:
+            conn.close()
+
+    return result
 
 # ═════════════════════════════════════════════════════════════════════════════
-# VÉRIFICATION 4 — Output directory (WD-FIX14 + WD-FIX20)
+# VÉRIFICATION 4 — Dernier rapport HTML (WD-FIX14)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def check_output_fresh() -> dict[str, Any]:
-    """
-    WD-FIX14 — Vérifie que le dernier rapport HTML a bien été généré.
-    WD-FIX20 — Glob pattern corrigé : "SENTINEL_*.html".
-    """
-    global _warnings
-    result: dict[str, Any] = {"last_html": None, "age_h": None, "ok": True}
+def check_output_files() -> dict[str, Any]:
+    """WD-FIX14 — Vérifie la présence d'un rapport HTML récent."""
+    result: dict[str, Any] = {"ok": False, "latest": None, "age_h": None}
 
     if not OUTPUT_DIR.is_dir():
+        log.warning(f"Répertoire output/ absent : {OUTPUT_DIR}")
         return result
 
-    html_files = sorted(
-        OUTPUT_DIR.glob("SENTINEL_*.html"),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
-
+    # WD-FIX20 : pattern corrigé "SENTINEL_*.html"
+    html_files = sorted(OUTPUT_DIR.glob("SENTINEL_*.html"), key=lambda p: p.stat().st_mtime)
     if not html_files:
+        global _warnings
         _warnings += 1
-        result.update(ok=False, detail="Aucun rapport HTML trouvé dans output/")
-        log.warning("output/ : aucun rapport HTML trouvé")
+        log.warning("Aucun rapport HTML trouvé dans output/")
         return result
 
-    latest  = html_files[0]
-    age_h   = (time.time() - latest.stat().st_mtime) / 3600
-    size_kb = latest.stat().st_size // 1024
-    result.update(last_html=latest.name, age_h=round(age_h, 1), size_kb=size_kb, ok=True)
+    latest     = html_files[-1]
+    age_h      = (time.time() - latest.stat().st_mtime) / 3600
+    result.update(ok=True, latest=str(latest.name), age_h=round(age_h, 1))
 
     if age_h > SEUIL_H_ALERTE + 2:
         _warnings += 1
-        log.warning(f"output/ : dernier HTML vieux de {age_h:.1f}h — {latest.name}")
+        log.warning(f"Dernier rapport HTML : {latest.name} — {age_h:.1f}h (ancien)")
     else:
-        log.info(f"output/ : {latest.name} ({age_h:.1f}h, {size_kb} KB) ✓")
+        log.info(f"Dernier rapport HTML : {latest.name} — {age_h:.1f}h ✓")
 
     return result
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# VÉRIFICATION 5 — Process zombie (WD-FIX15 + WD-FIX23 + WD-FIX34)
+# VÉRIFICATION 5 — Détection process zombie (WD-FIX15/34)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def check_zombie_process() -> bool:
+def check_zombie() -> bool:
     """
-    WD-FIX15 — Détecte si sentinel_main.py tourne depuis trop longtemps.
-    WD-FIX23 — Seuil étendu à 180 min le 1er du mois.
-    WD-FIX34 — Cross-platform via psutil. Fallback pgrep+/proc sur Linux.
+    WD-FIX15 — Détecte sentinel_main.py bloqué.
+    WD-FIX23 — Seuil étendu à 180 min le 1er du mois (rapport mensuel).
+    WD-FIX34 — psutil cross-platform (Linux/macOS/Windows).
     """
-    global _warnings
-
-    zombie_threshold_min = 180 if datetime.now().day == 1 else 90
+    today = datetime.now(timezone.utc)
+    zombie_threshold_min = 180 if today.day == 1 else 90
 
     # ── Branche psutil (Linux / macOS / Windows) ──────────────────────────────
     if _PSUTIL_AVAILABLE:
@@ -566,6 +603,7 @@ def check_zombie_process() -> bool:
                         continue
                     age_min = (time.time() - proc.info["create_time"]) / 60
                     if age_min > zombie_threshold_min:
+                        global _warnings
                         _warnings += 1
                         log.warning(
                             f"Process sentinel_main.py (PID {proc.info['pid']}) actif "
@@ -599,6 +637,7 @@ def check_zombie_process() -> bool:
                     starttime  = int(start_info[21]) / hz
                     age_min    = (uptime - starttime) / 60
                     if age_min > zombie_threshold_min:
+                        global _warnings
                         _warnings += 1
                         log.warning(
                             f"Process sentinel_main.py (PID {pid}) actif depuis "
@@ -613,7 +652,6 @@ def check_zombie_process() -> bool:
 
     return False
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # ROTATION DES LOGS (WD-FIX7 + WD-FIX26 + WD-FIX33)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -624,7 +662,6 @@ def rotate_logs_if_needed() -> bool:
     WD-FIX26 — Log explicite post-rotation pour éviter faux positif.
     WD-FIX33 — Bypass si SENTINEL_NO_ROTATE=1 (conflit logrotate).
     """
-    # WD-FIX33
     if DISABLE_INTERNAL_ROTATION:
         log.info("Rotation interne désactivée (SENTINEL_NO_ROTATE=1) — logrotate actif")
         return False
@@ -654,7 +691,6 @@ def rotate_logs_if_needed() -> bool:
         log.warning(f"Rotation logs échouée : {e}")
         return False
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # PURGE OUTPUT (WD-FIX27)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -675,327 +711,292 @@ def _purge_output_files(days: int = 30) -> int:
                 if f.stat().st_mtime < cutoff:
                     f.unlink()
                     removed += 1
-            except OSError:
-                pass
-
+            except OSError as e:
+                log.warning(f"Impossible de supprimer {f.name} : {e}")
     if removed:
-        log.info(f"Purge output/ : {removed} fichiers > {days}j supprimés")
+        log.info(f"Purge output/ : {removed} fichiers anciens supprimés (>{days}j)")
     return removed
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# AUTO-RESTART (WD-FIX8 + WD-FIX19 + WD-FIX34 + WD-FIX35 + WD-FIX36)
+# AUTO-RESTART (WD-FIX8)
 # ═════════════════════════════════════════════════════════════════════════════
-
-def _is_sentinel_running() -> bool:
-    """
-    WD-FIX34 — Vérifie si sentinel_main.py tourne. Cross-platform.
-    """
-    if _PSUTIL_AVAILABLE:
-        try:
-            for proc in psutil.process_iter(["cmdline"]):
-                try:
-                    cmdline = " ".join(proc.info.get("cmdline") or [])
-                    if "sentinel_main.py" in cmdline:
-                        return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except Exception:
-            pass
-        return False
-    else:
-        try:
-            r = subprocess.run(
-                ["pgrep", "-f", "sentinel_main.py"],
-                capture_output=True, text=True, timeout=5
-            )
-            return r.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
-
 
 def auto_restart_pipeline() -> bool:
     """
-    WD-FIX8  — Relance sentinel_main.py en arrière-plan.
-    WD-FIX19 — File handle fermé dans le parent après Popen.
-    WD-FIX34 — Vérification process via _is_sentinel_running().
-    WD-FIX35 — DETACHED_PROCESS + CREATE_NO_WINDOW sur Windows.
-    WD-FIX36 — pythonw.exe sur Windows (pas de fenêtre console).
+    WD-FIX8  — Redémarre sentinel_main.py en arrière-plan si mort.
+    WD-FIX19 — open() sans close() corrigé → context manager with.
+    WD-FIX35 — Flags Windows : DETACHED_PROCESS + CREATE_NO_WINDOW.
+    WD-FIX36 — pythonw.exe sur Windows.
     """
-    if _is_sentinel_running():
-        log.warning("Auto-restart annulé : sentinel_main.py déjà en cours")
+    main_script = _PROJECT_ROOT / "sentinel_main.py"
+    if not main_script.exists():
+        log.error(f"auto_restart : {main_script} introuvable")
         return False
 
-    log.info("Auto-restart : lancement de sentinel_main.py...")
+    log_restart = _PROJECT_ROOT / "logs" / "restart.log"
+    log.info(f"Auto-restart : lancement de {main_script}")
+
     try:
-        log_file   = open("logs/sentinel_restart.log", "a")
-        is_windows = platform.system() == "Windows"
-
-        if is_windows:
-            # WD-FIX36 — pythonw.exe : pas de fenêtre console
-            python_exec = Path(sys.executable).parent / "pythonw.exe"
-            if not python_exec.exists():
-                python_exec = Path(sys.executable)
-            # WD-FIX35 — flags Windows
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NO_WINDOW = 0x08000000
-            proc = subprocess.Popen(
-                [str(python_exec), "sentinel_main.py"],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-            )
+        if platform.system() == "Windows":
+            python_exe = "pythonw.exe"
+            kwargs: dict = {
+                "creationflags": 0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
+            }
         else:
+            python_exe = sys.executable
+            kwargs = {
+                "start_new_session": True,
+            }
+
+        # WD-FIX19 : context manager — plus d'open() sans close()
+        with open(log_restart, "a", encoding="utf-8") as log_fh:
             proc = subprocess.Popen(
-                [sys.executable, "sentinel_main.py"],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+                [python_exe, str(main_script)],
+                stdout=log_fh,
+                stderr=log_fh,
+                cwd=str(_PROJECT_ROOT),
+                **kwargs,
             )
 
-        log_file.close()  # WD-FIX19
         log.info(f"Auto-restart : sentinel_main.py lancé (PID {proc.pid})")
         return True
-    except (OSError, subprocess.SubprocessError) as e:
+
+    except Exception as e:
         log.error(f"Auto-restart échoué : {e}")
         return False
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# CONSTRUCTION EMAIL ALERTE (WD-FIX10 + WD-FIX22)
+# CONSTRUCTION EMAIL D'ALERTE — WD-60-FIX3 (datetime UTC)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _build_alert_email(
-    run_ok:    bool,
-    run_age_h: float,
-    run_msg:   str,
-    db:        dict,
-    disk:      dict,
-    output:    dict,
-    health:    dict,
-    zombie:    bool,
-    restarted: bool,
+    age_h:    float,
+    db_stats: dict,
+    disk:     dict,
+    detail:   str = "",
 ) -> tuple[str, str, str]:
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    """
+    WD-FIX10 — Alerte enrichie avec statistiques DB + disque.
+    WD-FIX22 — Annotation de retour : tuple[str, str, str] (subject, text, html).
+    WD-60-FIX3 — datetime.now(timezone.utc) — plus jamais de datetime naïf.
+    """
+    # WD-60-FIX3 : UTC systématique
+    now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    age_label = f"{age_h:.1f}h" if age_h < float("inf") else "INCONNU"
 
-    subject = (
-        f"🔴 SENTINEL WATCHDOG — Pipeline MORT depuis {run_age_h:.0f}h — {now_str}"
-        if _critiques > 0 else
-        f"⚠️ SENTINEL WATCHDOG — Warning pipeline — {now_str}"
-    )
+    subject = f"🚨 SENTINEL ALERTE — Pipeline silencieux depuis {age_label} [{now_str}]"
 
-    lines = [
-        f"SENTINEL v{VERSION} — Rapport Watchdog — {now_str}",
-        "=" * 60,
-        "",
-        f"ÉTAT PIPELINE : {'❌ MORT' if not run_ok else '⚠️ WARNING'}",
-        f"Dernier run   : {run_msg}",
-        f"Health HTTP   : {health.get('detail', 'non vérifié')}",
-        "",
-        "BASE DE DONNÉES :",
-        f"  • Rapports     : {db.get('n_reports', '?')}",
-        f"  • Seenhashes   : {db.get('n_seenhashes', '?')}",
-        f"  • Alertes      : {db.get('n_alertes', '?')}",
-        f"  • Taille DB    : {db.get('size_kb', '?')} KB",
-        f"  • Intégrité    : {'✓ OK' if db.get('ok') else '❌ CORROMPUE'}",
-        "",
-        "STOCKAGE :",
-        f"  • Disque libre : {disk.get('free_mb', '?')} MB ({disk.get('used_pct', '?')}% utilisé)",
-        f"  • Dernier HTML : {output.get('last_html', 'aucun')} ({output.get('age_h', '?')}h)",
-        "",
-    ]
-
-    if zombie:
-        lines += ["⚠️ PROCESS ZOMBIE détecté : sentinel_main.py bloqué", ""]
-    if restarted:
-        lines += ["✅ Auto-restart déclenché : sentinel_main.py relancé", ""]
-
-    lines += [
-        "ACTIONS RECOMMANDÉES :",
-        f"  1. Logs pipeline  : tail -100 {LOGFILE}",
-        "  2. Cron           : crontab -l | grep sentinel",
-        "  3. Test manuel    : python sentinel_main.py",
-        f"  4. Kill zombie    : kill $(pgrep -f sentinel_main.py)",
-        "",
-        f"Log watchdog  : logs/watchdog.log",
-        f"État watchdog : {STATE_FILE}",
-    ]
-
-    body = "
-".join(lines)
-
-    sqlite_cell = (
-        "❌ CORROMPUE" if not db.get("ok")
-        else f"✓ {db.get('n_reports', '?')} rapports"
-    )
-
-    html = (
-        f'<html><body style="font-family:monospace;font-size:13px">'
-        f'<h2 style="color:{"#c0392b" if _critiques > 0 else "#e67e22"}">{subject}</h2>'
-        f'<table border="1" cellpadding="6" cellspacing="0">'
-        f"<tr><th>Vérification</th><th>Résultat</th></tr>"
-        f"<tr><td>Pipeline</td><td>{run_msg}</td></tr>"
-        f"<tr><td>Health HTTP</td><td>{health.get('detail', '?')}</td></tr>"
-        f"<tr><td>SQLite</td><td>{sqlite_cell}</td></tr>"
-        f"<tr><td>Disque</td><td>{disk.get('free_mb', '?')} MB libres</td></tr>"
-        f"<tr><td>Dernier HTML</td><td>{output.get('last_html', 'aucun')} ({output.get('age_h', '?')}h)</td></tr>"
-        f"<tr><td>Process zombie</td><td>{'⚠️ Détecté' if zombie else '✓ OK'}</td></tr>"
-        f"<tr><td>Auto-restart</td><td>{'✅ Relancé' if restarted else '—'}</td></tr>"
-        f"</table>"
-        f'<pre style="margin-top:16px;background:#f4f4f4;padding:12px">'
-        + "
-".join(lines[-8:])
-        + "</pre></body></html>"
-    )
-
-    return subject, body, html
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# RÉSUMÉ QUOTIDIEN (WD-FIX11)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def send_daily_summary(run_age_h: float, db: dict, disk: dict, health: dict) -> None:
-    if not SMTP_USER or not SMTP_PASS:
-        return
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    subject = f"✅ SENTINEL — Pipeline opérationnel — {now_str}"
-    body = (
-        f"SENTINEL v{VERSION} — Résumé quotidien — {now_str}
+    text_body = (
+        f"SENTINEL — Alerte pipeline
 "
         f"{'=' * 50}
+"
+        f"Heure UTC     : {now_str}
+"
+        f"Silence       : {age_label}
+"
+        f"Seuil alerte  : {SEUIL_H_ALERTE}h
 
 "
-        f"Pipeline     : ✓ Dernier run il y a {run_age_h:.1f}h
+        f"ÉTAT DB
 "
-        f"Health HTTP  : {health.get('detail', 'non vérifié')}
+        f"-------
 "
-        f"Rapports     : {db.get('n_reports', '?')} dans SQLite
+        f"Intégrité     : {'OK' if db_stats.get('ok') else 'ERREUR'}
 "
-        f"Seenhashes   : {db.get('n_seenhashes', '?')} articles dédupliqués
+        f"Lignes        : {db_stats.get('counts', {})}
 "
-        f"Alertes      : {db.get('n_alertes', '?')} actives
+        f"BUG-DB-1      : {'OUI ⚠' if db_stats.get('bugdb1') else 'Non'}
+
 "
-        f"Disque       : {disk.get('free_mb', '?')} MB libres ({disk.get('used_pct', '?')}% utilisé)
+        f"DISQUE
 "
-        f"DB intègre   : {'Oui ✓' if db.get('ok') else 'NON — vérifier !'}
+        f"------
+"
+        f"Espace libre  : {disk.get('free_mb', '?')} MB
+
+"
+        f"DÉTAIL
+"
+        f"------
+"
+        f"{detail}
+
+"
+        f"Actions recommandées :
+"
+        f"  1. Vérifier logs/sentinel.log
+"
+        f"  2. python3 watchdog.py --restart
+"
+        f"  3. python3 health_check.py
 "
     )
-    send_alert(subject, body)
-    log.info("Résumé quotidien envoyé ✓")
 
+    html_body = f"""<html><body>
+<h2 style="color:#c0392b">🚨 SENTINEL — Alerte pipeline</h2>
+<table border="1" cellpadding="6" style="border-collapse:collapse">
+  <tr><th>Heure UTC</th><td>{now_str}</td></tr>
+  <tr><th>Silence pipeline</th><td><b>{age_label}</b></td></tr>
+  <tr><th>Seuil alerte</th><td>{SEUIL_H_ALERTE}h</td></tr>
+  <tr><th>DB intégrité</th><td>{'✅ OK' if db_stats.get('ok') else '❌ ERREUR'}</td></tr>
+  <tr><th>BUG-DB-1 (UNIQUE)</th><td>{'⚠️ OUI' if db_stats.get('bugdb1') else 'Non'}</td></tr>
+  <tr><th>Espace disque libre</th><td>{disk.get('free_mb','?')} MB</td></tr>
+</table>
+<pre style="background:#f4f4f4;padding:12px">{detail}</pre>
+<p><b>Actions :</b> vérifier logs/sentinel.log, relancer via watchdog.py --restart</p>
+</body></html>"""
+
+    return subject, text_body, html_body
 
 # ═════════════════════════════════════════════════════════════════════════════
-# POINT D'ENTRÉE PRINCIPAL
+# RÉSUMÉ QUOTIDIEN (WD-FIX11) — WD-60-FIX4 (datetime UTC)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_watchdog() -> int:
-    global _warnings, _critiques
-
-    # WD-FIX24 — réinitialisation des compteurs
-    _warnings  = 0
-    _critiques = 0
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    log.info("=" * 60)
-    log.info(f"SENTINEL v{VERSION} — Watchdog démarré — {now_str}")
-    log.info("=" * 60)
-
-    state = _load_state()
-
-    # Rotation logs
-    rotated = rotate_logs_if_needed()
-    if rotated:
-        log.info("Log roté — source principale ce cycle : SQLite")
-
-    # Purge output/
-    _purge_output_files(days=30)
-
-    # Vérifications
-    run_ok,   run_age_h, run_msg = check_last_run()
-    db_result                    = check_sqlite_health()
-    disk_result                  = check_disk_space()
-    output_result                = check_output_fresh()
-    health_result                = check_health_endpoint()
-    zombie                       = check_zombie_process()
-
-    log.info(f"Bilan watchdog : {_critiques} critique(s), {_warnings} warning(s)")
-    restarted = False
-
-    if _critiques > 0:
-        if _can_send_alert(state, "pipeline_mort"):
-            if AUTO_RESTART and not run_ok:
-                restarted = auto_restart_pipeline()
-            subject, body, html = _build_alert_email(
-                run_ok, run_age_h, run_msg,
-                db_result, disk_result, output_result,
-                health_result, zombie, restarted,
-            )
-            send_alert(subject, body, html)
-            _mark_alert_sent(state, "pipeline_mort")
-        else:
-            log.info("Anti-spam : alerte 'pipeline_mort' déjà envoyée dans les 4h — skip")
-
-    elif _warnings > 0:
-        if _can_send_alert(state, "pipeline_warn"):
-            subject = f"⚠️ SENTINEL — Warning pipeline — {now_str}"
-            body    = (
-                f"SENTINEL Watchdog v{VERSION}
-
-"
-                f"{run_msg}
-
-"
-                f"Disque : {disk_result.get('free_mb', '?')} MB libres
-"
-                f"Health : {health_result.get('detail', '?')}
-"
-            )
-            send_alert(subject, body)
-            _mark_alert_sent(state, "pipeline_warn")
-        else:
-            log.info("Anti-spam : alerte 'pipeline_warn' déjà envoyée dans les 4h — skip")
-    else:
-        log.info(f"Pipeline OK ✓ | {run_msg}")
-
-    # Résumé quotidien (WD-FIX11)
-    last_summary    = state.get("last_summary")
-    summary_elapsed = float("inf")
+def send_daily_summary(
+    state:    dict,
+    age_h:    float,
+    db_stats: dict,
+    disk:     dict,
+) -> None:
+    """
+    WD-FIX11  — Email résumé quotidien "pipeline vivant".
+    WD-60-FIX4 — datetime.now(timezone.utc) — plus jamais de datetime naïf.
+    """
+    # Anti-spam : 1 résumé max / 20h
+    last_summary = state.get("last_summary")
     if last_summary:
         try:
-            ls_dt = datetime.fromisoformat(last_summary)
-            if ls_dt.tzinfo is None:
-                ls_dt = ls_dt.replace(tzinfo=timezone.utc)
-            summary_elapsed = (datetime.now(timezone.utc) - ls_dt).total_seconds()
+            last_dt = datetime.fromisoformat(last_summary)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            # WD-60-FIX4 : UTC
+            if (datetime.now(timezone.utc) - last_dt).total_seconds() < 20 * 3600:
+                log.info("Résumé quotidien déjà envoyé (<20h) — skipped")
+                return
         except ValueError:
             pass
 
-    if FORCE_SUMMARY or (
-        run_ok and _critiques == 0 and _warnings == 0
-        and summary_elapsed > 20 * 3600
-    ):
-        send_daily_summary(run_age_h, db_result, disk_result, health_result)
+    # WD-60-FIX4 : UTC systématique
+    now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    age_label  = f"{age_h:.1f}h" if age_h < float("inf") else "?"
+    disk_free  = disk.get("free_mb", "?")
+    db_ok      = "✅ OK" if db_stats.get("ok") else "❌ ERREUR"
+
+    subject = f"✅ SENTINEL Résumé quotidien — Pipeline actif [{now_str}]"
+    body    = (
+        f"SENTINEL — Résumé quotidien
+"
+        f"{'=' * 40}
+"
+        f"Heure UTC    : {now_str}
+"
+        f"Dernier run  : il y a {age_label}
+"
+        f"DB           : {db_ok}
+"
+        f"Disque libre : {disk_free} MB
+"
+        f"Warnings     : {_warnings}
+"
+        f"Critiques    : {_critiques}
+"
+    )
+
+    if send_alert(subject, body):
+        # WD-60-FIX4 : UTC
         state["last_summary"] = datetime.now(timezone.utc).isoformat()
+        log.info("Résumé quotidien envoyé ✓")
+    else:
+        log.warning("Résumé quotidien : échec envoi email")
 
-    # Sauvegarde état (WD-FIX9 + WD-FIX28)
-    exit_code = 2 if _critiques > 0 else (1 if _warnings > 0 else 0)
+# ═════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATEUR PRINCIPAL
+# ═════════════════════════════════════════════════════════════════════════════
 
+def run_watchdog() -> int:
+    """
+    Exécute toutes les vérifications et retourne le code de sortie :
+      0 = OK, 1 = warning, 2 = critique.
+    WD-FIX24 — Compteurs réinitialisés en début de run.
+    WD-FIX28 — exit_code sauvegardé dans state["runs"].
+    """
+    global _warnings, _critiques
+    _warnings  = 0
+    _critiques = 0
+
+    log.info(f"=== WATCHDOG SENTINEL v{VERSION} — {datetime.now(timezone.utc).isoformat()} ===")
+
+    state = _load_state()
+
+    # ── 1. Rotation logs ──────────────────────────────────────────────────────
+    if FORCE_ROTATE or not DISABLE_INTERNAL_ROTATION:
+        rotate_logs_if_needed()
+
+    # ── 2. Vérifications ──────────────────────────────────────────────────────
+    pipeline_ok, age_h, detail = check_last_run()
+    db_stats                   = check_sqlite_db()
+    disk                       = check_disk_space()
+    output                     = check_output_files()
+
+    # Zombie uniquement si pipeline semble actif
+    zombie = check_zombie()
+    if zombie:
+        log.warning("ZOMBIE détecté — sentinel_main.py bloqué")
+
+    # ── 3. Décision alerte ────────────────────────────────────────────────────
+    is_critical = (not pipeline_ok) or (not db_stats.get("ok")) or _critiques > 0
+
+    if is_critical and _can_send_alert(state, "pipeline_dead"):
+        subject, text_body, html_body = _build_alert_email(age_h, db_stats, disk, detail)
+        if send_alert(subject, text_body, html_body):
+            _mark_alert_sent(state, "pipeline_dead")
+
+    # ── 4. Auto-restart ───────────────────────────────────────────────────────
+    if AUTO_RESTART and not pipeline_ok and not zombie:
+        restarted = auto_restart_pipeline()
+        log.info(f"Auto-restart : {'succès' if restarted else 'échec'}")
+
+    # ── 5. Résumé quotidien ───────────────────────────────────────────────────
+    if FORCE_SUMMARY or (pipeline_ok and not is_critical):
+        send_daily_summary(state, age_h, db_stats, disk)
+
+    # ── 6. Purge output anciens ───────────────────────────────────────────────
+    _purge_output_files(days=30)
+
+    # ── 7. Sauvegarde état (WD-FIX9/28) ──────────────────────────────────────
+    exit_code = 2 if is_critical else (1 if _warnings > 0 else 0)
     state.setdefault("runs", []).append({
         "ts":        datetime.now(timezone.utc).isoformat(),
-        "ok":        run_ok,
-        "age_h":     round(run_age_h, 1) if run_age_h != float("inf") else None,
+        "age_h":     age_h if age_h < float("inf") else None,
+        "ok":        pipeline_ok,
         "warnings":  _warnings,
         "critiques": _critiques,
         "exit_code": exit_code,
     })
+    # Garder seulement les 30 dernières entrées
     state["runs"] = state["runs"][-30:]
     _save_state(state)
 
-    log.info(f"Watchdog terminé — exit code {exit_code}")
-    log.info("=" * 60)
-    return exit_code
+    # ── 8. Rapport JSON (WD-FIX9) ─────────────────────────────────────────────
+    report_path = _PROJECT_ROOT / "logs" / "watchdog_state.json"
+    log.info(f"État watchdog → {report_path}")
 
+    summary = (
+        f"Watchdog v{VERSION} : "
+        f"pipeline={'OK' if pipeline_ok else 'MORT'}, "
+        f"age={age_h:.1f}h, "
+        f"warnings={_warnings}, critiques={_critiques}, "
+        f"exit={exit_code}"
+    )
+    if exit_code == 0:
+        log.info(summary)
+    elif exit_code == 1:
+        log.warning(summary)
+    else:
+        log.error(summary)
+
+    return exit_code
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
@@ -1003,9 +1004,11 @@ def run_watchdog() -> int:
 
 if __name__ == "__main__":
     try:
-        exit_code = run_watchdog()
-        sys.exit(exit_code)
-    except Exception as fatal:
-        # WD-FIX12 — reraise pour que cron/supervisor détecte l'échec
-        log.critical(f"FATAL watchdog.py : {fatal}", exc_info=True)
-        raise
+        code = run_watchdog()
+        sys.exit(code)
+    except KeyboardInterrupt:
+        log.info("Watchdog interrompu par l'utilisateur")
+        sys.exit(0)
+    except Exception as e:
+        log.error(f"Exception non gérée dans watchdog : {e}", exc_info=True)
+        sys.exit(2)  # WD-FIX12 — cron détecte l'échec
